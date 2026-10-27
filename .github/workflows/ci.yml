@@ -95,7 +95,7 @@ jobs:
           trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
           curl --fail --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8080/ > /dev/null
           curl --fail http://127.0.0.1:8080/api/overview > /tmp/overview.json
-          jq --exit-status '.docker_version != null and (.containers | length > 0) and (.host_uptime_seconds > 0)' /tmp/overview.json
+          jq --exit-status '.docker_version != null and (.containers | length > 0) and (.host_uptime_seconds > 0) and all(.containers[]; .image_id != null and .image_created_at != null)' /tmp/overview.json
           curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
       - name: Publish latest and commit image
         if: steps.image.outputs.publish == 'true'

@@ -140,6 +140,8 @@ struct Container {
     name: String,
     image: String,
     version: String,
+    image_id: Option<String>,
+    image_created_at: Option<String>,
     status: String,
     started_at: String,
     uptime_seconds: i64,
@@ -155,7 +157,17 @@ fn image_version(image: &str) -> String {
         .map(|(_, tag)| tag.to_owned())
         .unwrap_or_else(|| "latest (implicit)".into())
 }
-fn container(value: &Value) -> Container {
+fn container(value: &Value, images: &[Value]) -> Container {
+    let image_id = value["Image"].as_str();
+    let image_created_at = image_id
+        .and_then(|id| images.iter().find(|image| image["Id"].as_str() == Some(id)))
+        .and_then(|image| image["Created"].as_str())
+        .and_then(|created| DateTime::parse_from_rfc3339(created).ok())
+        .map(|created| {
+            created
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        });
     let image = value["Config"]["Image"]
         .as_str()
         .unwrap_or("unknown")
@@ -179,6 +191,8 @@ fn container(value: &Value) -> Container {
             .trim_start_matches('/')
             .into(),
         version: image_version(&image),
+        image_id: image_id.map(str::to_owned),
+        image_created_at,
         image,
         status: value["State"]["Status"]
             .as_str()
@@ -199,11 +213,31 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
         let mut args = vec!["container", "inspect"];
         args.extend(ids.split_whitespace());
         let inspected = docker_json(&state, &args).await?;
-        containers = inspected
+        let inspected = inspected
             .as_array()
-            .ok_or_else(|| unavailable("Expected a container array"))?
+            .ok_or_else(|| unavailable("Expected a container array"))?;
+        // Resolve immutable image IDs, not tags: :latest may now refer to a
+        // different image than the one this container is actually running.
+        let mut image_ids: Vec<_> = inspected
             .iter()
-            .map(container)
+            .filter_map(|container| container["Image"].as_str())
+            .collect();
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        let images = if image_ids.is_empty() {
+            Vec::new()
+        } else {
+            let mut args = vec!["image", "inspect"];
+            args.extend(image_ids);
+            docker_json(&state, &args)
+                .await?
+                .as_array()
+                .ok_or_else(|| unavailable("Expected an image array"))?
+                .clone()
+        };
+        containers = inspected
+            .iter()
+            .map(|value| container(value, &images))
             .collect();
         containers.sort_by(|a, b| a.name.cmp(&b.name));
     }

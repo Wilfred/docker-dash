@@ -28,7 +28,10 @@ impl Fixture {
 case "$1" in
 version) printf '%s\n' '{{"Server":{{"Version":"29.0.0"}}}}';;
 ps) {ps} ;;
-container) printf '%s\n' '[{{"Id":"aaaaaaaaaaaa","Name":"/web","Config":{{"Image":"registry:5000/web:2.1"}},"State":{{"Status":"running","StartedAt":"2026-01-01T00:00:00Z"}}}}]';;
+container) printf '%s\n' '[{{"Id":"aaaaaaaaaaaa","Name":"/web","Image":"sha256:abc123","Config":{{"Image":"registry:5000/web:2.1"}},"State":{{"Status":"running","StartedAt":"2026-01-01T00:00:00Z"}}}}]';;
+image)
+  [ "$2" = "inspect" ] && [ "$3" = "sha256:abc123" ] || exit 1
+  printf '%s\n' '[{{"Id":"sha256:newtag","Created":"2026-10-27T10:00:00Z"}},{{"Id":"sha256:abc123","Created":"2025-12-01T13:30:00+01:00"}}]';;
 logs)
   if [ -f "{dir}/read" ]; then echo 'should only capture logs once' >&2; exit 1; fi
   touch "{dir}/read"
@@ -86,6 +89,11 @@ async fn overview_reads_docker_and_host() {
     assert_eq!(data["host_uptime_seconds"], 90061.5);
     assert_eq!(data["containers"][0]["name"], "web");
     assert_eq!(data["containers"][0]["version"], "2.1");
+    assert_eq!(data["containers"][0]["image_id"], "sha256:abc123");
+    assert_eq!(
+        data["containers"][0]["image_created_at"],
+        "2025-12-01T12:30:00Z"
+    );
     assert!(data["containers"][0]["uptime_seconds"].as_i64().unwrap() > 0);
 }
 #[tokio::test]
@@ -198,6 +206,7 @@ async fn overview_html_contains_data_without_javascript() {
         "Running containers (1)",
         "aaaaaaaaaaaa",
         "registry:5000/web:2.1",
+        "Image built (UTC)</dt><dd>2025-12-01T12:30:00Z",
         "2026-01-01T00:00:00Z",
         "href=\"/containers/aaaaaaaaaaaa/logs\"",
         "href=\"/api/overview\"",
@@ -274,4 +283,28 @@ async fn html_escapes_metadata_logs_and_errors() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(error.contains("&lt;script&gt;denied&lt;/script&gt;"));
     assert!(error.contains("Retry overview"));
+}
+
+#[tokio::test]
+async fn latest_images_show_actual_image_creation_time() {
+    let f = Fixture::new("running");
+    let path = f.0.join("docker");
+    let script = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("web:2.1", "web:latest");
+    std::fs::write(&path, &script).unwrap();
+    let (_, data) = get(f.app(), "/api/overview").await;
+    assert_eq!(data["containers"][0]["version"], "latest");
+    assert_eq!(
+        data["containers"][0]["image_created_at"],
+        "2025-12-01T12:30:00Z"
+    );
+    for missing in ["", "invalid"] {
+        std::fs::write(&path, script.replace("2025-12-01T13:30:00+01:00", missing)).unwrap();
+        let (status, data) = get(f.app(), "/api/overview").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(data["containers"][0]["image_created_at"].is_null());
+        let (_, page) = html(f.app(), "/").await;
+        assert!(page.contains("Image built (UTC)</dt><dd>Unavailable"));
+    }
 }

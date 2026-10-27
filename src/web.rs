@@ -71,11 +71,12 @@ pub(super) async fn index(State(state): State<AppState>) -> Response {
              <dt>ID</dt><dd>{id}</dd>\
              <dt>Image</dt><dd>{}</dd>\
              <dt>Version / tag</dt><dd>{}</dd>\
+             <dt>Image built (UTC)</dt><dd>{}</dd>\
              <dt>Status</dt><dd>{}</dd>\
              <dt>Started at (UTC)</dt><dd>{}</dd>\
              <dt>Uptime</dt><dd>{}</dd></dl>\
              <p><a href=\"/containers/{id}/logs\">Logs for {}</a> · <a href=\"/api/containers/{id}/logs\">Logs JSON for {}</a></p></section>",
-            text(&c["name"]), text(&c["name"]), text(&c["image"]), text(&c["version"]), text(&c["status"]), text(&c["started_at"]), duration(&c["uptime_seconds"]), text(&c["name"]), text(&c["name"])
+            text(&c["name"]), text(&c["name"]), text(&c["image"]), text(&c["version"]), text(&c["image_created_at"]), text(&c["status"]), text(&c["started_at"]), duration(&c["uptime_seconds"]), text(&c["name"]), text(&c["name"])
         ));
     }
     document(StatusCode::OK, content)

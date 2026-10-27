@@ -31,7 +31,8 @@ DOCKER_DASH_BIND=127.0.0.1:9090 cargo run --release
 The dashboard has no authentication. Keep its default loopback binding or put it
 behind an authenticated reverse proxy before exposing it to other machines.
 The application only issues read commands (`version`, `ps`, `container inspect`,
-and `logs`); access to the Docker socket itself still grants broad host privileges.
+`image inspect`, and `logs`); access to the Docker socket itself still grants
+broad host privileges.
 
 ## Dashboard behavior
 
@@ -41,6 +42,11 @@ and `logs`); access to the Docker socket itself still grants broad host privileg
   `latest (implicit)`.
 - Shows the Docker **server** version and Linux host uptime from `/proc/uptime`.
   Host uptime displays as unavailable on systems without that file.
+- Shows the running image's build/creation time in UTC, using `Created` from
+  `docker image inspect` against the container's immutable image ID. This is
+  image metadata, not the time it was pulled or the container was started, and
+  does not depend on where a mutable tag such as `latest` points now. Missing
+  or invalid timestamps display as unavailable (JSON `null`).
 - Shows full container IDs, UTC timestamps, and uptime including exact seconds.
   Use **Refresh** to fetch a new overview; pages do not change while being read.
 - **Logs** captures recent stdout and stderr, merged by Docker timestamps.
@@ -79,7 +85,8 @@ curl --fail "http://127.0.0.1:8080/api/containers/CONTAINER_ID/logs"
 Replace `CONTAINER_ID` with a container ID from the overview (and quote the URL in a
 shell if using query parameters). The overview includes `checked_at`,
 `docker_version`, `host_uptime_seconds`, and `containers`. Each container includes
-`id`, `name`, `image`, `version`, `status`, `started_at`, and `uptime_seconds`.
+`id`, `name`, `image`, `version`, `image_id`, `image_created_at` (UTC), `status`,
+`started_at`, and `uptime_seconds`.
 Logs return `lines`, `page` (zero-based), `until` (the snapshot token), `has_older`,
 and `history_limit_reached`. Follow the HTML page's **This page as JSON** link,
 or pass the returned `until` and increment `page` to fetch older history.
