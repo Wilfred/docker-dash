@@ -156,7 +156,7 @@ async fn invalid_queries_and_docker_failures_are_clear() {
 #[tokio::test]
 async fn assets_are_embedded_and_protected() {
     let f = Fixture::new("empty");
-    for path in ["/", "/app.js", "/style.css"] {
+    for path in ["/", "/style.css"] {
         let response = f
             .app()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -175,4 +175,103 @@ async fn assets_are_embedded_and_protected() {
                 .is_empty()
         );
     }
+}
+
+async fn html(app: Router, url: &str) -> (StatusCode, String) {
+    let response = app
+        .oneshot(Request::builder().uri(url).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn overview_html_contains_data_without_javascript() {
+    let f = Fixture::new("running");
+    let (status, body) = html(f.app(), "/").await;
+    assert_eq!(status, StatusCode::OK);
+    for expected in [
+        "29.0.0",
+        "90061 seconds",
+        "Running containers (1)",
+        "aaaaaaaaaaaa",
+        "registry:5000/web:2.1",
+        "2026-01-01T00:00:00Z",
+        "href=\"/containers/aaaaaaaaaaaa/logs\"",
+        "href=\"/api/overview\"",
+    ] {
+        assert!(body.contains(expected), "missing {expected}");
+    }
+    assert!(!body.contains("<script"));
+    assert!(!body.contains("<input"));
+    let (_, empty) = html(Fixture::new("empty").app(), "/").await;
+    assert!(empty.contains("No running containers."));
+}
+
+#[tokio::test]
+async fn html_log_links_preserve_snapshot_and_expose_json() {
+    let f = Fixture::new("running");
+    let app = f.app();
+    let (status, first) = html(app.clone(), "/containers/aaaaaaaaaaaa/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.contains("Page</dt><dd>1 (100 lines)"));
+    let older = first
+        .split("href=\"")
+        .find_map(|part| {
+            let (url, rest) = part.split_once('"')?;
+            rest.starts_with(">Older</a>")
+                .then(|| url.replace("&amp;", "&"))
+        })
+        .unwrap();
+    let (status, second) = html(app.clone(), &older).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(second.contains("Page</dt><dd>2 (100 lines)"));
+    let json_url = second
+        .split("href=\"")
+        .find_map(|part| {
+            let (url, rest) = part.split_once('"')?;
+            rest.starts_with(">This page as JSON</a>")
+                .then(|| url.replace("&amp;", "&"))
+        })
+        .unwrap();
+    let (status, data) = get(app.clone(), &json_url).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["page"], 1);
+    assert_eq!(data["lines"].as_array().unwrap().len(), 100);
+    let (status, expired) = html(app, "/containers/aaaaaaaaaaaa/logs?until=expired").await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(expired.contains("Log snapshot expired"));
+    assert!(expired.contains("href=\"/containers/aaaaaaaaaaaa/logs\">Latest"));
+}
+
+#[tokio::test]
+async fn html_escapes_metadata_logs_and_errors() {
+    let f = Fixture::new("running");
+    let path = f.0.join("docker");
+    let script = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("/web\"", "/<script>alert(1)</script>\"");
+    std::fs::write(&path, script).unwrap();
+    let (_, overview) = html(f.app(), "/").await;
+    assert!(overview.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!overview.contains("<script>"));
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' '2026-01-01T00:00:00Z <script>alert(1)</script>'\n",
+    )
+    .unwrap();
+    let (_, logs) = html(f.app(), "/containers/aaaaaaaaaaaa/logs").await;
+    assert!(logs.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!logs.contains("<script>"));
+    std::fs::write(
+        &path,
+        "#!/bin/sh\necho '<script>denied</script>' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let (status, error) = html(f.app(), "/").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.contains("&lt;script&gt;denied&lt;/script&gt;"));
+    assert!(error.contains("Retry overview"));
 }

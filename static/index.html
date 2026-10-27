@@ -3,33 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>docker-dash · Host overview</title>
+  <meta name="color-scheme" content="light dark">
+  <title>docker-dash</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><a class="brand" href="/">▦ <span>docker<span class="muted">-dash</span></span></a><span class="local">LOCAL HOST</span></header>
-  <main>
-    <div class="heading"><div><p class="eyebrow">YOUR INFRASTRUCTURE, AT A GLANCE</p><h1>Host overview<span class="accent">.</span></h1><p class="muted">A little clarity for your containers.</p></div><button id="refresh">↻ Refresh</button></div>
-    <p id="error" role="alert" hidden></p>
-    <section class="metrics" aria-label="Host information">
-      <article><span class="metric-label">RUNNING CONTAINERS</span><strong id="count">—</strong><span class="metric-note">on this Docker host</span></article>
-      <article><span class="metric-label">DOCKER ENGINE</span><strong id="version">—</strong><span class="metric-note">server version</span></article>
-      <article><span class="metric-label">HOST UPTIME</span><strong id="uptime">—</strong><span class="metric-note">since the last boot</span></article>
-    </section>
-    <section class="containers-section" aria-labelledby="containers-title">
-      <div class="section-heading"><h2 id="containers-title">Containers <span id="badge">0</span></h2><label class="search"><span>⌕</span><input id="search" type="search" aria-label="Filter containers" placeholder="Filter by name or image…"></label></div>
-      <div class="table-wrap"><table><thead><tr><th>CONTAINER</th><th>IMAGE</th><th>VERSION / TAG</th><th>UPTIME</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="containers"></tbody></table><p id="empty" class="empty" role="status">Connecting to Docker…</p></div>
-      <p class="footnote"><span class="status-dot"></span><span id="updated">Waiting for host data</span><span>Read-only · refreshes every 15 seconds</span></p>
-    </section>
-    <section id="log-panel" hidden aria-labelledby="log-title">
-      <div class="section-heading"><div><p class="eyebrow">CONTAINER OUTPUT</p><h2 id="log-title">Logs</h2></div><button id="close-logs" aria-label="Close logs">✕ Close</button></div>
-      <div class="log-toolbar"><span id="log-mode">Latest output</span><div><button id="latest">↻ Latest</button><button id="newer">← Newer</button><button id="older">Older →</button></div></div>
-      <p id="log-error" role="alert" hidden></p><pre id="logs" tabindex="0" aria-label="Container log output">Loading…</pre>
-      <p class="muted log-note">100 lines per page, oldest first. History stays at a fixed snapshot; Latest starts a new snapshot.</p>
-    </section>
-  </main>
-  <footer>docker-dash <span>Small dashboard. Clear picture.</span></footer>
+  <header><h1>docker-dash</h1><nav aria-label="Host navigation"><a href="/">Host overview</a> · <a href="/api/overview">Overview JSON</a></nav></header>
+  <main>{{content}}</main>
 </body>
 </html>

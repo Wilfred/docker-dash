@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use chrono::{DateTime, Utc};
@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+
+mod web;
 
 const PAGE_SIZE: usize = 100;
 const MAX_PAGE: usize = 99;
@@ -38,19 +40,8 @@ impl Default for AppState {
 
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .route(
-            "/",
-            get(|| async { Html(include_str!("../static/index.html")) }),
-        )
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("../static/app.js"),
-                )
-            }),
-        )
+        .route("/", get(web::index))
+        .route("/containers/{id}/logs", get(web::container_logs))
         .route(
             "/style.css",
             get(|| async {

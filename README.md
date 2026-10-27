@@ -1,7 +1,9 @@
 # docker-dash
 
-A simple Rust web UI showing basic information about the Docker containers
-running on the current host.
+A minimal, server-rendered Rust web UI for inspecting Docker containers on a
+single host. Designed for fewer than ten containers and for agents investigating
+production issues. Pages contain complete text data and ordinary links; no
+JavaScript is required.
 
 For each container, you can see the image, version, uptime and logs
 (latest or paginated history), plus the Docker version and uptime of
@@ -17,7 +19,7 @@ docker version
 cargo run --release
 ```
 
-Open **http://127.0.0.1:8080**. The binary embeds its HTML, CSS, and JavaScript;
+Open **http://127.0.0.1:8080**. The binary embeds its HTML and CSS;
 there is no Node build step or external asset service. Stop it with Ctrl+C.
 
 To use another listen address:
@@ -39,9 +41,9 @@ and `logs`); access to the Docker socket itself still grants broad host privileg
   `latest (implicit)`.
 - Shows the Docker **server** version and Linux host uptime from `/proc/uptime`.
   Host uptime displays as unavailable on systems without that file.
-- Refreshes the overview every 15 seconds while the tab is visible. Filter by
-  name, image, or tag, or use **Refresh** to update immediately.
-- **View logs** captures recent stdout and stderr, merged by Docker timestamps.
+- Shows full container IDs, UTC timestamps, and uptime including exact seconds.
+  Use **Refresh** to fetch a new overview; pages do not change while being read.
+- **Logs** captures recent stdout and stderr, merged by Docker timestamps.
   Each page contains up to 100 lines, in chronological order. **Older** and
   **Newer** navigate the captured history; **Latest** captures fresh output.
   Log content is displayed as plain text.
@@ -60,6 +62,29 @@ The Docker CLI inherits its usual context and environment, including
 `DOCKER_HOST`. Use a local Docker context to match this application's intended
 scope: host uptime always describes the machine running docker-dash, even if
 the CLI points at a remote daemon.
+
+## Agent access
+
+The HTML overview (`/`) and log pages (`/containers/<id>/logs`) include their data
+in the response body, so HTTP clients and agents can read them without a browser
+runtime. Log pagination uses ordinary links that keep the snapshot fixed.
+
+For structured data:
+
+```sh
+curl --fail http://127.0.0.1:8080/api/overview
+curl --fail "http://127.0.0.1:8080/api/containers/CONTAINER_ID/logs"
+```
+
+Replace `CONTAINER_ID` with a container ID from the overview (and quote the URL in a
+shell if using query parameters). The overview includes `checked_at`,
+`docker_version`, `host_uptime_seconds`, and `containers`. Each container includes
+`id`, `name`, `image`, `version`, `status`, `started_at`, and `uptime_seconds`.
+Logs return `lines`, `page` (zero-based), `until` (the snapshot token), `has_older`,
+and `history_limit_reached`. Follow the HTML page's **This page as JSON** link,
+or pass the returned `until` and increment `page` to fetch older history.
+Expired snapshots return HTTP 410; omit `until` and use page 0 to capture again.
+Errors return non-2xx status codes and a JSON `error` string on API routes.
 
 ## Develop and verify
 
