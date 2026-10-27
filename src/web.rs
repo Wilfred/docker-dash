@@ -173,21 +173,35 @@ fn diagnostics_fields(c: &Value) -> String {
     content
 }
 
-fn document(status: StatusCode, content: String) -> Response {
+async fn document(state: &AppState, status: StatusCode, content: String) -> Response {
+    let title = match engine::json(state, "/info").await {
+        Ok(host) => host["Name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("docker-dash - {}", escape(name)))
+            .unwrap_or_else(|| "docker-dash".into()),
+        Err(_) => "docker-dash".into(),
+    };
     (
         status,
-        Html(include_str!("../static/index.html").replace("{{content}}", &content)),
+        Html(
+            include_str!("../static/index.html")
+                .replace("{{title}}", &title)
+                .replace("{{content}}", &content),
+        ),
     )
         .into_response()
 }
-fn error(error: ApiError, recovery: &str) -> Response {
+async fn error(state: &AppState, error: ApiError, recovery: &str) -> Response {
     document(
+        state,
         error.0,
         format!(
             "<h2>Request failed</h2><p class=\"error\" role=\"alert\">{}</p>{recovery}",
             escape(&error.1)
         ),
     )
+    .await
 }
 
 fn short_duration(value: &Value) -> String {
@@ -207,9 +221,9 @@ fn short_duration(value: &Value) -> String {
 }
 
 pub(super) async fn index(State(state): State<AppState>) -> Response {
-    let data = match overview(State(state)).await {
+    let data = match overview(State(state.clone())).await {
         Ok(Json(data)) => data,
-        Err(err) => return error(err, "<p><a href=\"/\">Retry overview</a></p>"),
+        Err(err) => return error(&state, err, "<p><a href=\"/\">Retry overview</a></p>").await,
     };
     let mut content = "<h2>Host</h2><dl>".to_owned();
     field(&mut content, "Name", &scalar(&data["host"]["name"]));
@@ -259,16 +273,16 @@ pub(super) async fn index(State(state): State<AppState>) -> Response {
         }
         content.push_str("</tbody></table></div>");
     }
-    document(StatusCode::OK, content)
+    document(&state, StatusCode::OK, content).await
 }
 
 pub(super) async fn container_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let c = match container_json(State(state), Path(id)).await {
+    let c = match container_json(State(state.clone()), Path(id)).await {
         Ok(Json(data)) => data,
-        Err(err) => return error(err, "<p><a href=\"/\">Host overview</a></p>"),
+        Err(err) => return error(&state, err, "<p><a href=\"/\">Host overview</a></p>").await,
     };
     let id = text(&c["id"]);
     let mut content = format!(
@@ -314,7 +328,7 @@ pub(super) async fn container_detail(
     );
     content.push_str("</dl>");
     content.push_str(&diagnostics_fields(&c));
-    document(StatusCode::OK, content)
+    document(&state, StatusCode::OK, content).await
 }
 
 pub(super) async fn container_logs(
@@ -325,14 +339,16 @@ pub(super) async fn container_logs(
     // Validate before placing the ID into any links, including error recovery.
     if !valid_id(&id) {
         return error(
+            &state,
             ApiError(StatusCode::BAD_REQUEST, "Invalid container ID".into()),
             "",
-        );
+        )
+        .await;
     }
     let latest = format!("<a href=\"/containers/{id}/logs\">Latest</a>");
-    let data = match logs(State(state), Path(id.clone()), Query(query)).await {
+    let data = match logs(State(state.clone()), Path(id.clone()), Query(query)).await {
         Ok(Json(data)) => data,
-        Err(err) => return error(err, &format!("<p>{latest}</p>")),
+        Err(err) => return error(&state, err, &format!("<p>{latest}</p>")).await,
     };
     let page = data["page"].as_u64().unwrap();
     let until = text(&data["until"]);
@@ -365,6 +381,7 @@ pub(super) async fn container_logs(
         ""
     };
     document(
+        &state,
         StatusCode::OK,
         format!(
             "<h2>Container logs</h2><dl><dt>Container ID</dt><dd>{id}</dd><dt>Snapshot (UTC)</dt><dd>{until}</dd><dt>Page</dt><dd>{} ({} lines)</dd></dl>\
@@ -373,12 +390,13 @@ pub(super) async fn container_logs(
             lines.len()
         ),
     )
+    .await
 }
 
 pub(super) async fn usage(State(state): State<AppState>) -> Response {
-    let data = match super::usage(State(state)).await {
+    let data = match super::usage(State(state.clone())).await {
         Ok(Json(data)) => data,
-        Err(err) => return error(err, "<p><a href=\"/usage\">Retry usage</a></p>"),
+        Err(err) => return error(&state, err, "<p><a href=\"/usage\">Retry usage</a></p>").await,
     };
     let mut content = format!(
         "<h2>Resource usage</h2><p>Sampled at (UTC): {}. Network and block I/O are cumulative counters.</p><p><a href=\"/usage\">Refresh</a> · <a href=\"/api/usage\">Usage JSON</a></p><div class=\"table-wrap\"><table><thead><tr><th>Container</th><th>CPU</th><th>Memory used / limit</th><th>Memory %</th><th>Network RX / TX</th><th>Disk read / write</th><th>Processes</th></tr></thead><tbody>",
@@ -404,5 +422,5 @@ pub(super) async fn usage(State(state): State<AppState>) -> Response {
     if containers.is_empty() {
         content.push_str("<p>No running containers.</p>");
     }
-    document(StatusCode::OK, content)
+    document(&state, StatusCode::OK, content).await
 }
