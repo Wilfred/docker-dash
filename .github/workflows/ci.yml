@@ -102,6 +102,10 @@ jobs:
           jq --exit-status --arg created "$created_id" --arg exited "$exited_id" \
             '(.containers | any(.id == $created and .status == "created" and .started_at == null and .uptime_seconds == null)) and (.containers | any(.id == $exited and .status == "exited" and .exit_code == 0 and .uptime_seconds == null))' \
             /tmp/overview.json
+          jq --exit-status --arg id "$container_id" \
+            '.host.cpus > 0 and (.containers | any(.id == $id and (.ports | any(.container_port == "8080/tcp" and (.published | length > 0)))))' \
+            /tmp/overview.json
+          curl --fail http://127.0.0.1:8080/api/usage | jq --exit-status '.containers | length > 0'
           curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
       - name: Publish latest and commit image
         if: steps.image.outputs.publish == 'true'

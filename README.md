@@ -31,7 +31,7 @@ DOCKER_DASH_BIND=127.0.0.1:9090 cargo run --release
 The dashboard has no authentication. Keep its default loopback binding or put it
 behind an authenticated reverse proxy before exposing it to other machines.
 The application only issues read commands (`version`, `ps`, `container inspect`,
-`image inspect`, and `logs`); access to the Docker socket itself still grants
+`image inspect`, `info`, `stats`, and `logs`); access to the Docker socket itself still grants
 broad host privileges.
 
 ## Dashboard behavior
@@ -43,6 +43,18 @@ broad host privileges.
   are marked explicitly. A tag is the image's
   declared version, not a detected application version. Untagged names show
   `latest (implicit)`.
+- Shows published port bindings, configured bindings on inactive containers,
+  exposed-only ports, network mode, network attachments, and container IPs.
+  Host networking shares host ports; Docker does not report those listening
+  sockets. Exposed ports describe configuration, not proof of a listener.
+- Shows health status/failure count, OOM kills, restart count/policy, sanitized
+  Docker state errors, container creation time, logging driver, and memory,
+  CPU and process limits.
+- **Resource usage** (`/usage`, `/api/usage`) samples running containers on
+  demand: CPU, memory, process count, and network/block I/O counters. It does
+  not poll in the background. The JSON uses Docker's unit-bearing strings.
+- Shows the Docker host name, OS, kernel, architecture, CPU count and memory
+  from `docker info` (selected fields only).
 - Shows the Docker **server** version and Linux host uptime from `/proc/uptime`.
   Host uptime displays as unavailable on systems without that file.
 - Shows each container image's build/creation time in UTC, using `Created` from
@@ -66,12 +78,65 @@ broad host privileges.
 - Docker commands time out after 15 seconds. Output is limited to 4 MiB per
   stream per command; unusually large logs produce an error rather than being
   silently truncated. Docker connection errors and unsupported logging drivers
-  appear in the UI.
+  appear in the UI. At most four Docker commands run concurrently; requests
+  waiting longer than five seconds receive a retryable HTTP 503.
 
 The Docker CLI inherits its usual context and environment, including
 `DOCKER_HOST`. Use a local Docker context to match this application's intended
 scope: host uptime always describes the machine running docker-dash, even if
 the CLI points at a remote daemon.
+
+## Tailnet sharing and sensitive data
+
+Keep the dashboard bound to loopback, then expose it to your tailnet using
+[Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
+
+```sh
+tailscale serve --bg http://127.0.0.1:8080
+tailscale serve status
+```
+
+Use the HTTPS URL reported by Serve for agent access, including `/api/overview`
+and `/api/usage`. Restrict access to the intended users/devices through your
+Tailscale access policy. The app has no login and does not treat forwarded
+identity headers as authentication. Serve provides the network access boundary;
+Funnel would publish it outside the tailnet and is not needed here. The commands
+above configure Serve at `/`; mounting under a subpath is not supported.
+
+When running the image with host networking, keep it on loopback too:
+
+```sh
+docker run --detach --name docker-dash \
+  --network host \
+  --env DOCKER_DASH_BIND=127.0.0.1:8080 \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+  --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+  ghcr.io/wilfred/docker-dash:latest
+```
+
+Inspection responses use an explicit field allowlist. Environment variables,
+commands/arguments, labels, health-check commands/output, mount sources,
+logging options, registry credentials, and raw Docker inspection documents are
+not exposed. Logs and Docker state errors mask exact values from environment
+variables named for secrets (keys, tokens, passwords, credentials, auth,
+cookies, DSNs, database URLs), plus passwords extracted from connection URLs.
+Masking occurs before snapshots are cached and applies to HTML and JSON.
+
+This is best-effort masking, not a guarantee that arbitrary log/error messages
+are secret-free: encoded values, file-based secrets, unusually named variables,
+and unrelated credentials may remain. Treat log access as privileged. To share
+metadata and usage without exposing application logs, set:
+
+```sh
+DOCKER_DASH_LOGS=false cargo run --release
+# For the image, add: --env DOCKER_DASH_LOGS=false
+```
+
+Log links and free-form Docker state errors are removed; both HTML and JSON log
+endpoints return HTTP 403,
+including requests for existing snapshots. `DOCKER_DASH_LOGS` accepts only
+`true` or `false`; the default is `true`. Responses are uncached, cannot be
+framed, forbid scripts, omit referrers, and ask crawlers not to index them.
 
 ## Agent access
 
@@ -83,16 +148,25 @@ For structured data:
 
 ```sh
 curl --fail http://127.0.0.1:8080/api/overview
+curl --fail http://127.0.0.1:8080/api/usage
 curl --fail "http://127.0.0.1:8080/api/containers/CONTAINER_ID/logs"
 ```
 
 Replace `CONTAINER_ID` with a container ID from the overview (and quote the URL in a
 shell if using query parameters). The overview includes `checked_at`,
-`docker_version`, `host_uptime_seconds`, and `containers`. Each container includes
+`docker_version`, `host` (Docker host details), `host_uptime_seconds`,
+`logs_enabled`, and `containers`. Each container includes
 `id`, `name`, `image`, `version`, `image_id`, `image_created_at` (UTC), `status`,
 `started_at`, `finished_at`, `exit_code`, and `uptime_seconds`. Lifecycle
 fields are `null` when not applicable (for example, uptime for exited containers
-or start time for containers that have never started).
+or start time for containers that have never started). Additional fields include
+`created_at`, `state_error`, `healthcheck_configured`, `health_status`,
+`health_failing_streak`, `oom_killed`,
+`restart_count`, `restart_policy`, `restart_max_retries`, `network_mode`, `ports`
+(each with `container_port`, `published` and `configured` bindings), `networks`,
+`memory_limit_bytes`, `nano_cpus`, `cpu_quota`, `cpu_period`, `pids_limit`, and
+`log_driver`. Zero memory/CPU limits mean no explicit Docker limit; process
+limits of zero/negative mean unlimited, and null means the Docker default.
 Logs return `lines`, `page` (zero-based), `until` (the snapshot token), `has_older`,
 and `history_limit_reached`. Follow the HTML page's **This page as JSON** link,
 or pass the returned `until` and increment `page` to fetch older history.

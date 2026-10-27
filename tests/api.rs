@@ -26,6 +26,8 @@ impl Fixture {
         let script = format!(
             r#"#!/bin/sh
 case "$1" in
+info) echo '{{"Name":"test-host","OperatingSystem":"Debian","KernelVersion":"6.1","Architecture":"x86_64","NCPU":4,"MemTotal":8589934592,"DriverStatus":[["private","HOST_SECRET"]]}}';;
+stats) echo '{{"ID":"aaaaaaaaaaaa","Name":"web","CPUPerc":"1.25%","MemUsage":"32MiB / 1GiB","MemPerc":"3.12%","NetIO":"1kB / 2kB","BlockIO":"0B / 4kB","PIDs":"3","Extra":"STATS_SECRET"}}';;
 version) printf '%s\n' '{{"Server":{{"Version":"29.0.0"}}}}';;
 ps)
   [ "$2" = "--all" ] || exit 1
@@ -270,7 +272,7 @@ async fn html_escapes_metadata_logs_and_errors() {
     assert!(!overview.contains("<script>"));
     std::fs::write(
         &path,
-        "#!/bin/sh\nprintf '%s\\n' '2026-01-01T00:00:00Z <script>alert(1)</script>'\n",
+        "#!/bin/sh\ncase \"$1\" in\ncontainer) echo '[]';;\nlogs) printf '%s\\n' '2026-01-01T00:00:00Z <script>alert(1)</script>';;\nesac\n",
     )
     .unwrap();
     let (_, logs) = html(f.app(), "/containers/aaaaaaaaaaaa/logs").await;
@@ -322,6 +324,7 @@ async fn all_container_states_are_visible_with_accurate_lifecycle_data() {
     let script = format!(
         r#"#!/bin/sh
 case "$1" in
+info) echo '{{"Name":"test-host"}}';;
 version) echo '{{"Server":{{"Version":"29.0.0"}}}}';;
 ps)
   [ "$2" = "--all" ] || exit 1
@@ -375,4 +378,168 @@ esac
         assert!(page.contains(expected), "missing {expected}");
     }
     assert!(!page.contains("0001-01-01"));
+}
+
+impl Fixture {
+    fn set_inspect(&self, records: Value) {
+        let path = self.0.join("docker");
+        let script = std::fs::read_to_string(&path).unwrap();
+        let quoted = records.to_string().replace('\'', "'\"'\"'");
+        let replacement = format!("container) printf '%s\\n' '{quoted}';;");
+        let script = script
+            .lines()
+            .map(|line| {
+                if line.starts_with("container)") {
+                    replacement.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, script).unwrap();
+    }
+}
+
+fn diagnostic_records() -> Value {
+    serde_json::json!([{
+        "Id":"aaaaaaaaaaaa", "Name":"/web", "Image":"sha256:abc123", "Created":"2026-01-01T00:00:00Z", "RestartCount":7,
+        "Config":{"Image":"web:latest", "Env":["API_KEY=ENV_SECRET", "DATABASE_URL=postgres://user:DB_PASSWORD@db/app", "PUBLIC_VALUE=UNEXPOSED_ENV"], "Cmd":["COMMAND_SECRET"], "Labels":{"key":"LABEL_SECRET"}, "Healthcheck":{"Test":["HEALTH_COMMAND_SECRET"]}, "ExposedPorts":{"80/tcp":{},"53/udp":{}}},
+        "State":{"Status":"running","StartedAt":"2026-01-01T00:00:00Z","OOMKilled":true,"Error":"startup failed ENV_SECRET", "Health":{"Status":"unhealthy", "FailingStreak":3, "Log":[{"Output":"HEALTH_OUTPUT_SECRET"}]}},
+        "HostConfig":{"NetworkMode":"bridge", "PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}],"443/tcp":[{"HostIp":"::","HostPort":"8443"}]}, "RestartPolicy":{"Name":"on-failure","MaximumRetryCount":5}, "Memory":536870912, "NanoCpus":1500000000, "CpuQuota":0,"CpuPeriod":0,"PidsLimit":100,"LogConfig":{"Type":"json-file","Config":{"private":"LOG_OPTIONS_SECRET"}}, "Binds":["MOUNT_PATH_SECRET"]},
+        "NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080","Unexpected":"PORT_SECRET"}], "53/udp":null}, "Networks":{"frontend":{"IPAddress":"172.18.0.2","GlobalIPv6Address":"fd00::2","Unexpected":"NETWORK_SECRET"}}},
+        "Mounts":[{"Source":"MOUNT_PATH_SECRET"}]
+    }])
+}
+
+#[tokio::test]
+async fn diagnostics_are_useful_without_exposing_inspect_secrets() {
+    let f = Fixture::new("running");
+    f.set_inspect(diagnostic_records());
+    let (status, data) = get(f.app(), "/api/overview").await;
+    assert_eq!(status, StatusCode::OK);
+    let c = &data["containers"][0];
+    assert_eq!(c["restart_count"], 7);
+    assert_eq!(c["health_status"], "unhealthy");
+    assert_eq!(c["health_failing_streak"], 3);
+    assert_eq!(c["oom_killed"], true);
+    assert_eq!(c["memory_limit_bytes"], 536870912);
+    assert_eq!(c["nano_cpus"], 1500000000u64);
+    assert_eq!(c["state_error"], "startup failed [REDACTED]");
+    assert_eq!(c["ports"][0]["container_port"], "443/tcp");
+    assert_eq!(c["ports"][0]["published"], serde_json::json!([]));
+    assert_eq!(c["ports"][0]["configured"][0]["host_port"], "8443");
+    assert_eq!(c["ports"][2]["published"][0]["host_ip"], "127.0.0.1");
+    assert_eq!(c["networks"][0]["ipv4_address"], "172.18.0.2");
+    assert_eq!(data["host"]["cpus"], 4);
+    let (_, html) = html(f.app(), "/").await;
+    for expected in [
+        "unhealthy",
+        "Restarts",
+        "127.0.0.1",
+        "8080",
+        "8443",
+        "not currently published",
+        "exposed only",
+        "172.18.0.2",
+        "512.0 MiB",
+        "1.5 CPUs",
+        "[REDACTED]",
+    ] {
+        assert!(html.contains(expected), "missing {expected}");
+    }
+    for secret in [
+        "ENV_SECRET",
+        "DB_PASSWORD",
+        "UNEXPOSED_ENV",
+        "COMMAND_SECRET",
+        "LABEL_SECRET",
+        "HEALTH_COMMAND_SECRET",
+        "HEALTH_OUTPUT_SECRET",
+        "LOG_OPTIONS_SECRET",
+        "MOUNT_PATH_SECRET",
+        "PORT_SECRET",
+        "NETWORK_SECRET",
+        "HOST_SECRET",
+    ] {
+        assert!(!data.to_string().contains(secret), "JSON exposed {secret}");
+        assert!(!html.contains(secret), "HTML exposed {secret}");
+    }
+}
+
+#[tokio::test]
+async fn logs_mask_known_environment_secrets_before_caching() {
+    let f = Fixture::new("running");
+    f.set_inspect(diagnostic_records());
+    let path = f.0.join("docker");
+    let script = std::fs::read_to_string(&path).unwrap();
+    let before_logs = script.split("logs)\n").next().unwrap();
+    std::fs::write(&path, format!("{before_logs}logs) printf '%s\\n' '2026-01-01T00:00:00Z ENV_SECRET postgres://user:DB_PASSWORD@db/app DB_PASSWORD' >&2;;\nesac\n")).unwrap();
+    let app = f.app();
+    let (status, data) = get(app.clone(), "/api/containers/aaaaaaaaaaaa/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!data.to_string().contains("ENV_SECRET"));
+    assert!(!data.to_string().contains("DB_PASSWORD"));
+    assert_eq!(
+        data["lines"][0],
+        "2026-01-01T00:00:00Z [REDACTED] [REDACTED] [REDACTED]"
+    );
+    // A changed environment cannot expose original values from the cache.
+    std::fs::write(path, "#!/bin/sh\nexit 1\n").unwrap();
+    let url = format!(
+        "/containers/aaaaaaaaaaaa/logs?until={}",
+        data["until"].as_str().unwrap()
+    );
+    let (status, body) = html(app, &url).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("[REDACTED]"));
+    assert!(!body.contains("ENV_SECRET"));
+}
+
+#[tokio::test]
+async fn logs_can_be_disabled_for_tailnet_sharing() {
+    let mut state = AppState::default();
+    state.docker = "/no/docker/needed".into();
+    state.logs_enabled = false;
+    let app = app(state);
+    assert_eq!(
+        get(app.clone(), "/api/containers/aaaaaaaaaaaa/logs")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        html(app, "/containers/aaaaaaaaaaaa/logs").await.0,
+        StatusCode::FORBIDDEN
+    );
+    let f = Fixture::new("running");
+    f.set_inspect(diagnostic_records());
+    let mut state = AppState::default();
+    state.docker = f.0.join("docker").to_string_lossy().into_owned();
+    state.logs_enabled = false;
+    let app = docker_dash::app(state);
+    let (_, data) = get(app.clone(), "/api/overview").await;
+    assert!(data["containers"][0]["state_error"].is_null());
+    let (_, body) = html(app, "/").await;
+    assert!(body.contains("Log access disabled."));
+    assert!(!body.contains("href=\"/containers/aaaaaaaaaaaa/logs\""));
+}
+
+#[tokio::test]
+async fn usage_returns_selected_fields_and_readable_html() {
+    let f = Fixture::new("running");
+    let (status, data) = get(f.app(), "/api/usage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["containers"][0]["cpu_percent"], "1.25%");
+    assert_eq!(data["containers"][0]["pids"], "3");
+    assert!(!data.to_string().contains("STATS_SECRET"));
+    let (status, body) = html(f.app(), "/usage").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("32MiB / 1GiB"));
+    assert!(!body.contains("STATS_SECRET"));
+    std::fs::write(f.0.join("docker"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(
+        get(f.app(), "/api/usage").await.1["containers"],
+        serde_json::json!([])
+    );
 }

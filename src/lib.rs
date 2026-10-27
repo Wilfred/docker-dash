@@ -16,7 +16,9 @@ use std::{
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
+mod diagnostics;
 mod web;
 
 const PAGE_SIZE: usize = 100;
@@ -26,14 +28,18 @@ const MAX_PAGE: usize = 99;
 pub struct AppState {
     pub docker: String,
     pub uptime_path: String,
+    pub logs_enabled: bool,
     snapshots: Arc<Mutex<VecDeque<Snapshot>>>,
+    commands: Arc<Semaphore>,
 }
 impl Default for AppState {
     fn default() -> Self {
         Self {
             docker: "docker".into(),
             uptime_path: "/proc/uptime".into(),
+            logs_enabled: true,
             snapshots: Arc::default(),
+            commands: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -52,15 +58,19 @@ pub fn app(state: AppState) -> Router {
             }),
         )
         .route("/api/overview", get(overview))
+        .route("/usage", get(web::usage))
+        .route("/api/usage", get(usage))
         .route("/api/containers/{id}/logs", get(logs))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
                 let headers = response.headers_mut();
                 headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
                 headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+                headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+                headers.insert("x-robots-tag", "noindex, nofollow".parse().unwrap());
                 headers.insert(
                     header::CONTENT_SECURITY_POLICY,
-                    "default-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+                    "default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
                         .parse()
                         .unwrap(),
                 );
@@ -101,6 +111,10 @@ async fn read_output(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Resu
 }
 
 async fn docker_output(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
+    let _permit = tokio::time::timeout(Duration::from_secs(5), state.commands.acquire())
+        .await
+        .map_err(|_| unavailable("Dashboard is busy. Retry the request."))?
+        .map_err(|_| unavailable("Dashboard is shutting down"))?;
     let mut cmd = Command::new(&state.docker);
     cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -151,8 +165,13 @@ struct Container {
     finished_at: Option<String>,
     exit_code: Option<i64>,
     uptime_seconds: Option<i64>,
+    #[serde(flatten)]
+    diagnostics: Value,
 }
 fn image_version(image: &str) -> String {
+    if image.starts_with("sha256:") || valid_id(image) {
+        return "untagged".into();
+    }
     if let Some((_, digest)) = image.split_once('@') {
         return digest.into();
     }
@@ -212,12 +231,14 @@ fn container(value: &Value, images: &[Value]) -> Container {
         finished_at,
         exit_code,
         uptime_seconds,
+        diagnostics: diagnostics::container_details(value),
     }
 }
 async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
-    let (version, ids) = tokio::try_join!(
+    let (version, ids, host) = tokio::try_join!(
         docker_json(&state, &["version", "--format", "{{json .}}"]),
-        docker(&state, &["ps", "--all", "--quiet", "--no-trunc"])
+        docker(&state, &["ps", "--all", "--quiet", "--no-trunc"]),
+        docker_json(&state, &["info", "--format", "{{json .}}"])
     )?;
     let ids = String::from_utf8_lossy(&ids.stdout);
     let mut containers = Vec::new();
@@ -255,6 +276,11 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
             .iter()
             .map(|value| container(value, &images))
             .collect();
+        if !state.logs_enabled {
+            for container in &mut containers {
+                container.diagnostics["state_error"] = Value::Null;
+            }
+        }
         containers.sort_by(|a, b| a.name.cmp(&b.name));
     }
     let uptime = tokio::fs::read_to_string(&state.uptime_path)
@@ -263,10 +289,35 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
         .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok());
     Ok(Json(json!({
         "docker_version": version["Server"]["Version"],
+        "host": diagnostics::host_details(&host),
+        "logs_enabled": state.logs_enabled,
         "host_uptime_seconds": uptime,
         "containers": containers,
         "checked_at": Utc::now().to_rfc3339(),
     })))
+}
+
+async fn usage(State(state): State<AppState>) -> ApiResult<Value> {
+    let output = docker(
+        &state,
+        &[
+            "stats",
+            "--no-stream",
+            "--no-trunc",
+            "--format",
+            "{{json .}}",
+        ],
+    )
+    .await?;
+    let containers = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).map(|value| diagnostics::usage(&value)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| unavailable("Invalid Docker usage response"))?;
+    Ok(Json(
+        json!({"checked_at": Utc::now().to_rfc3339(), "containers": containers}),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -294,6 +345,12 @@ async fn logs(
     Path(id): Path<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Value> {
+    if !state.logs_enabled {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Log access is disabled on this dashboard".into(),
+        ));
+    }
     let page = query.page.unwrap_or(0);
     if !valid_id(&id) || page > MAX_PAGE {
         return Err(ApiError(
@@ -325,11 +382,22 @@ async fn logs(
         // each page could otherwise skip entries as new logs arrive.
         let until = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let tail = ((MAX_PAGE + 1) * PAGE_SIZE + 1).to_string();
-        let output = docker(&state, &["logs", "--timestamps", "--tail", &tail, &id]).await?;
+        let inspected = docker_json(&state, &["container", "inspect", &id]).await?;
+        let secrets = diagnostics::secret_values(
+            inspected
+                .as_array()
+                .ok_or_else(|| unavailable("Expected a container array"))?,
+        );
+        let output = docker_output(&state, &["logs", "--timestamps", "--tail", &tail, &id]).await?;
+        if !output.status.success() {
+            return Err(unavailable(
+                "Docker could not read logs. Check the container and logging driver.",
+            ));
+        }
         let lines: Vec<String> = [&output.stdout, &output.stderr]
             .iter()
             .flat_map(|bytes| {
-                String::from_utf8_lossy(bytes)
+                diagnostics::redact(&String::from_utf8_lossy(bytes), &secrets)
                     .lines()
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
