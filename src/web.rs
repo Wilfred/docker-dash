@@ -55,17 +55,34 @@ pub(super) async fn index(State(state): State<AppState>) -> Response {
     let containers = data["containers"].as_array().unwrap();
     let mut content = format!(
         "<h2>Host</h2><dl><dt>Docker version</dt><dd>{}</dd><dt>Host uptime</dt><dd>{}</dd><dt>Checked at (UTC)</dt><dd>{}</dd></dl>\
-         <p><a href=\"/\">Refresh</a></p><h2>Running containers ({})</h2>",
+         <p><a href=\"/\">Refresh</a></p><h2>Containers ({})</h2>",
         text(&data["docker_version"]),
         duration(&data["host_uptime_seconds"]),
         text(&data["checked_at"]),
         containers.len()
     );
     if containers.is_empty() {
-        content.push_str("<p>No running containers.</p>");
+        content.push_str("<p>No containers.</p>");
     }
     for c in containers {
         let id = text(&c["id"]);
+        let started_at = c["started_at"]
+            .as_str()
+            .map(escape)
+            .unwrap_or_else(|| "Never started".into());
+        let finished_at = c["finished_at"]
+            .as_str()
+            .map(escape)
+            .unwrap_or_else(|| "Not finished".into());
+        let exit_code = c["exit_code"]
+            .as_i64()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "Not exited".into());
+        let uptime = if c["uptime_seconds"].is_null() {
+            "Not running".into()
+        } else {
+            duration(&c["uptime_seconds"])
+        };
         content.push_str(&format!(
             "<section class=\"container\" aria-label=\"Container {}\"><h3>{}</h3><dl>\
              <dt>ID</dt><dd>{id}</dd>\
@@ -73,10 +90,12 @@ pub(super) async fn index(State(state): State<AppState>) -> Response {
              <dt>Version / tag</dt><dd>{}</dd>\
              <dt>Image built (UTC)</dt><dd>{}</dd>\
              <dt>Status</dt><dd>{}</dd>\
-             <dt>Started at (UTC)</dt><dd>{}</dd>\
-             <dt>Uptime</dt><dd>{}</dd></dl>\
+             <dt>Started at (UTC)</dt><dd>{started_at}</dd>\
+             <dt>Finished at (UTC)</dt><dd>{finished_at}</dd>\
+             <dt>Exit code</dt><dd>{exit_code}</dd>\
+             <dt>Uptime</dt><dd>{uptime}</dd></dl>\
              <p><a href=\"/containers/{id}/logs\">Logs for {}</a> · <a href=\"/api/containers/{id}/logs\">Logs JSON for {}</a></p></section>",
-            text(&c["name"]), text(&c["name"]), text(&c["image"]), text(&c["version"]), text(&c["image_created_at"]), text(&c["status"]), text(&c["started_at"]), duration(&c["uptime_seconds"]), text(&c["name"]), text(&c["name"])
+            text(&c["name"]), text(&c["name"]), text(&c["image"]), text(&c["version"]), text(&c["image_created_at"]), text(&c["status"]), text(&c["name"]), text(&c["name"])
         ));
     }
     document(StatusCode::OK, content)

@@ -100,7 +100,7 @@ async fn read_output(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Resu
     Ok(bytes)
 }
 
-async fn docker(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
+async fn docker_output(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
     let mut cmd = Command::new(&state.docker);
     cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -120,6 +120,10 @@ async fn docker(state: &AppState, args: &[&str]) -> Result<std::process::Output,
         stdout,
         stderr,
     };
+    Ok(result)
+}
+async fn docker(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
+    let result = docker_output(state, args).await?;
     if !result.status.success() {
         let message = String::from_utf8_lossy(&result.stderr);
         return Err(unavailable(format!(
@@ -143,8 +147,10 @@ struct Container {
     image_id: Option<String>,
     image_created_at: Option<String>,
     status: String,
-    started_at: String,
-    uptime_seconds: i64,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    exit_code: Option<i64>,
+    uptime_seconds: Option<i64>,
 }
 fn image_version(image: &str) -> String {
     if let Some((_, digest)) = image.split_once('@') {
@@ -172,17 +178,24 @@ fn container(value: &Value, images: &[Value]) -> Container {
         .as_str()
         .unwrap_or("unknown")
         .to_owned();
-    let started_at = value["State"]["StartedAt"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
-    let uptime_seconds = DateTime::parse_from_rfc3339(&started_at)
-        .map(|start| {
-            (Utc::now() - start.with_timezone(&Utc))
-                .num_seconds()
-                .max(0)
-        })
-        .unwrap_or(0);
+    let status = value["State"]["Status"].as_str().unwrap_or("unknown");
+    let parse_timestamp = |field: &str| {
+        value["State"][field]
+            .as_str()
+            .filter(|date| !date.starts_with("0001-"))
+            .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
+            .map(|date| date.with_timezone(&Utc))
+    };
+    let started = parse_timestamp("StartedAt");
+    let uptime_seconds = started
+        .filter(|_| matches!(status, "running" | "paused"))
+        .map(|start| (Utc::now() - start).num_seconds().max(0));
+    let finished_at = parse_timestamp("FinishedAt")
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    let started_at = started.map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true));
+    let exit_code = matches!(status, "exited" | "dead")
+        .then(|| value["State"]["ExitCode"].as_i64())
+        .flatten();
     Container {
         id: value["Id"].as_str().unwrap_or_default().into(),
         name: value["Name"]
@@ -194,18 +207,17 @@ fn container(value: &Value, images: &[Value]) -> Container {
         image_id: image_id.map(str::to_owned),
         image_created_at,
         image,
-        status: value["State"]["Status"]
-            .as_str()
-            .unwrap_or("unknown")
-            .into(),
+        status: status.into(),
         started_at,
+        finished_at,
+        exit_code,
         uptime_seconds,
     }
 }
 async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
     let (version, ids) = tokio::try_join!(
         docker_json(&state, &["version", "--format", "{{json .}}"]),
-        docker(&state, &["ps", "--quiet", "--no-trunc"])
+        docker(&state, &["ps", "--all", "--quiet", "--no-trunc"])
     )?;
     let ids = String::from_utf8_lossy(&ids.stdout);
     let mut containers = Vec::new();
@@ -229,8 +241,12 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
         } else {
             let mut args = vec!["image", "inspect"];
             args.extend(image_ids);
-            docker_json(&state, &args)
-                .await?
+            // Old containers may reference removed images. Docker returns the
+            // available image records even when some IDs cannot be inspected.
+            let output = docker_output(&state, &args).await?;
+            let images: Value = serde_json::from_slice(&output.stdout)
+                .map_err(|e| unavailable(format!("Invalid Docker image response: {e}")))?;
+            images
                 .as_array()
                 .ok_or_else(|| unavailable("Expected an image array"))?
                 .clone()

@@ -27,7 +27,9 @@ impl Fixture {
             r#"#!/bin/sh
 case "$1" in
 version) printf '%s\n' '{{"Server":{{"Version":"29.0.0"}}}}';;
-ps) {ps} ;;
+ps)
+  [ "$2" = "--all" ] || exit 1
+  {ps} ;;
 container) printf '%s\n' '[{{"Id":"aaaaaaaaaaaa","Name":"/web","Image":"sha256:abc123","Config":{{"Image":"registry:5000/web:2.1"}},"State":{{"Status":"running","StartedAt":"2026-01-01T00:00:00Z"}}}}]';;
 image)
   [ "$2" = "inspect" ] && [ "$3" = "sha256:abc123" ] || exit 1
@@ -203,7 +205,7 @@ async fn overview_html_contains_data_without_javascript() {
     for expected in [
         "29.0.0",
         "90061 seconds",
-        "Running containers (1)",
+        "Containers (1)",
         "aaaaaaaaaaaa",
         "registry:5000/web:2.1",
         "Image built (UTC)</dt><dd>2025-12-01T12:30:00Z",
@@ -216,7 +218,7 @@ async fn overview_html_contains_data_without_javascript() {
     assert!(!body.contains("<script"));
     assert!(!body.contains("<input"));
     let (_, empty) = html(Fixture::new("empty").app(), "/").await;
-    assert!(empty.contains("No running containers."));
+    assert!(empty.contains("No containers."));
 }
 
 #[tokio::test]
@@ -307,4 +309,70 @@ async fn latest_images_show_actual_image_creation_time() {
         let (_, page) = html(f.app(), "/").await;
         assert!(page.contains("Image built (UTC)</dt><dd>Unavailable"));
     }
+}
+
+#[tokio::test]
+async fn all_container_states_are_visible_with_accurate_lifecycle_data() {
+    let f = Fixture::new("running");
+    let records = serde_json::json!([
+        {"Id":"aaaaaaaaaaaa","Name":"/running","Image":"sha256:abc123","Config":{"Image":"web:latest"},"State":{"Status":"running","StartedAt":"2026-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z","ExitCode":0}},
+        {"Id":"bbbbbbbbbbbb","Name":"/created","Image":"sha256:missing","Config":{"Image":"old-image"},"State":{"Status":"created","StartedAt":"0001-01-01T00:00:00Z","FinishedAt":"0001-01-01T00:00:00Z","ExitCode":0}},
+        {"Id":"cccccccccccc","Name":"/exited","Image":"sha256:abc123","Config":{"Image":"web:latest"},"State":{"Status":"exited","StartedAt":"2025-01-01T00:00:00Z","FinishedAt":"2025-01-01T00:00:05Z","ExitCode":2}}
+    ]);
+    let script = format!(
+        r#"#!/bin/sh
+case "$1" in
+version) echo '{{"Server":{{"Version":"29.0.0"}}}}';;
+ps)
+  [ "$2" = "--all" ] || exit 1
+  printf '%s\n' aaaaaaaaaaaa bbbbbbbbbbbb cccccccccccc;;
+container) printf '%s\n' '{records}';;
+image)
+  [ "$3" = "sha256:abc123" ] && [ "$4" = "sha256:missing" ] && [ "$#" -eq 4 ] || exit 1
+  echo '[{{"Id":"sha256:abc123","Created":"2025-01-01T00:00:00Z"}}]'
+  echo 'No such image: sha256:missing' >&2
+  exit 1;;
+esac
+"#
+    );
+    std::fs::write(f.0.join("docker"), script).unwrap();
+    let app = f.app();
+    let (status, data) = get(app.clone(), "/api/overview").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["containers"].as_array().unwrap().len(), 3);
+    let created = &data["containers"][0];
+    assert_eq!(created["status"], "created");
+    for field in [
+        "started_at",
+        "finished_at",
+        "exit_code",
+        "uptime_seconds",
+        "image_created_at",
+    ] {
+        assert!(created[field].is_null(), "{field}");
+    }
+    let exited = &data["containers"][1];
+    assert_eq!(exited["status"], "exited");
+    assert_eq!(exited["exit_code"], 2);
+    assert_eq!(exited["finished_at"], "2025-01-01T00:00:05Z");
+    assert!(exited["uptime_seconds"].is_null());
+    let running = &data["containers"][2];
+    assert!(running["uptime_seconds"].as_i64().unwrap() > 0);
+    assert!(running["exit_code"].is_null());
+    let (status, page) = html(app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    for expected in [
+        "Containers (3)",
+        ">created<",
+        ">exited<",
+        ">running<",
+        "Never started",
+        "Not running",
+        "Exit code</dt><dd>2",
+        "Finished at (UTC)</dt><dd>2025-01-01T00:00:05Z",
+        "href=\"/containers/bbbbbbbbbbbb/logs\"",
+    ] {
+        assert!(page.contains(expected), "missing {expected}");
+    }
+    assert!(!page.contains("0001-01-01"));
 }

@@ -92,10 +92,16 @@ jobs:
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             --volume /var/run/docker.sock:/var/run/docker.sock:ro \
             docker-dash:smoke)
-          trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
+          created_id=$(docker create --entrypoint /bin/true docker-dash:smoke)
+          exited_id=$(docker create --entrypoint /bin/true docker-dash:smoke)
+          trap 'docker logs "$container_id"; docker rm --force "$container_id" "$created_id" "$exited_id"' EXIT
+          docker start --attach "$exited_id"
           curl --fail --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8080/ > /dev/null
           curl --fail http://127.0.0.1:8080/api/overview > /tmp/overview.json
           jq --exit-status '.docker_version != null and (.containers | length > 0) and (.host_uptime_seconds > 0) and all(.containers[]; .image_id != null and .image_created_at != null)' /tmp/overview.json
+          jq --exit-status --arg created "$created_id" --arg exited "$exited_id" \
+            '(.containers | any(.id == $created and .status == "created" and .started_at == null and .uptime_seconds == null)) and (.containers | any(.id == $exited and .status == "exited" and .exit_code == 0 and .uptime_seconds == null))' \
+            /tmp/overview.json
           curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
       - name: Publish latest and commit image
         if: steps.image.outputs.publish == 'true'

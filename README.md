@@ -36,17 +36,21 @@ broad host privileges.
 
 ## Dashboard behavior
 
-- Lists running containers with their name, ID, image reference, image tag or
-  digest, status, and time since the most recent start. A tag is the image's
+- Lists all containers, including created, running, paused, and exited ones,
+  with their name, ID, image reference, image tag or digest, and status.
+  Uptime is shown only for running/paused containers; stopped containers show
+  their last start/finish timestamps and exit code, and never-started containers
+  are marked explicitly. A tag is the image's
   declared version, not a detected application version. Untagged names show
   `latest (implicit)`.
 - Shows the Docker **server** version and Linux host uptime from `/proc/uptime`.
   Host uptime displays as unavailable on systems without that file.
-- Shows the running image's build/creation time in UTC, using `Created` from
+- Shows each container image's build/creation time in UTC, using `Created` from
   `docker image inspect` against the container's immutable image ID. This is
   image metadata, not the time it was pulled or the container was started, and
   does not depend on where a mutable tag such as `latest` points now. Missing
-  or invalid timestamps display as unavailable (JSON `null`).
+  or invalid timestamps display as unavailable (JSON `null`). Removed images
+  also display as unavailable without hiding their containers.
 - Shows full container IDs, UTC timestamps, and uptime including exact seconds.
   Use **Refresh** to fetch a new overview; pages do not change while being read.
 - **Logs** captures recent stdout and stderr, merged by Docker timestamps.
@@ -86,7 +90,9 @@ Replace `CONTAINER_ID` with a container ID from the overview (and quote the URL 
 shell if using query parameters). The overview includes `checked_at`,
 `docker_version`, `host_uptime_seconds`, and `containers`. Each container includes
 `id`, `name`, `image`, `version`, `image_id`, `image_created_at` (UTC), `status`,
-`started_at`, and `uptime_seconds`.
+`started_at`, `finished_at`, `exit_code`, and `uptime_seconds`. Lifecycle
+fields are `null` when not applicable (for example, uptime for exited containers
+or start time for containers that have never started).
 Logs return `lines`, `page` (zero-based), `until` (the snapshot token), `has_older`,
 and `history_limit_reached`. Follow the HTML page's **This page as JSON** link,
 or pass the returned `until` and increment `page` to fetch older history.
