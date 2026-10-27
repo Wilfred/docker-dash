@@ -86,16 +86,17 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Smoke test image with host Docker
         run: |
-          docker run --rm --entrypoint docker docker-dash:smoke --version
+          docker run --rm --entrypoint /bin/sh docker-dash:smoke -c '! command -v docker'
           container_id=$(docker run --detach \
             --publish 127.0.0.1:8080:8080 \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             --volume /var/run/docker.sock:/var/run/docker.sock:ro \
             docker-dash:smoke)
           created_id=$(docker create --entrypoint /bin/true docker-dash:smoke)
-          exited_id=$(docker create --entrypoint /bin/true docker-dash:smoke)
+          exited_id=$(docker create --env DASH_TEST_TOKEN=MASK_ME_FROM_LOGS \
+            --entrypoint /bin/sh docker-dash:smoke -c 'echo "$DASH_TEST_TOKEN"')
           trap 'docker logs "$container_id"; docker rm --force "$container_id" "$created_id" "$exited_id"' EXIT
-          docker start --attach "$exited_id"
+          docker start --attach "$exited_id" > /dev/null
           curl --fail --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8080/ > /dev/null
           curl --fail http://127.0.0.1:8080/api/overview > /tmp/overview.json
           jq --exit-status '.docker_version != null and (.containers | length > 0) and (.host_uptime_seconds > 0) and all(.containers[]; .image_id != null and .image_created_at != null)' /tmp/overview.json
@@ -106,6 +107,8 @@ jobs:
             '.host.cpus > 0 and (.containers | any(.id == $id and (.ports | any(.container_port == "8080/tcp" and (.published | length > 0)))))' \
             /tmp/overview.json
           curl --fail http://127.0.0.1:8080/api/usage | jq --exit-status '.containers | length > 0'
+          curl --fail "http://127.0.0.1:8080/api/containers/$exited_id/logs" \
+            | jq --exit-status '(.lines | any(contains("[REDACTED]"))) and (.lines | all(contains("MASK_ME_FROM_LOGS") | not))'
           curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
       - name: Publish latest and commit image
         if: steps.image.outputs.publish == 'true'

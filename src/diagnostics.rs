@@ -84,13 +84,89 @@ pub(super) fn host_details(value: &Value) -> Value {
     })
 }
 
-pub(super) fn usage(value: &Value) -> Value {
+fn human_bytes(bytes: u64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", units[unit])
+}
+pub(super) fn usage(container: &Value, stats: &Value) -> Value {
+    let cpu = &stats["cpu_stats"];
+    let previous = &stats["precpu_stats"];
+    let cpu_percent = (|| {
+        let delta = cpu["cpu_usage"]["total_usage"]
+            .as_u64()?
+            .checked_sub(previous["cpu_usage"]["total_usage"].as_u64()?)?;
+        let system_delta = cpu["system_cpu_usage"]
+            .as_u64()?
+            .checked_sub(previous["system_cpu_usage"].as_u64()?)?;
+        let cores = cpu["online_cpus"].as_u64().or_else(|| {
+            cpu["cpu_usage"]["percpu_usage"]
+                .as_array()
+                .map(|v| v.len() as u64)
+        })?;
+        (system_delta > 0 && cores > 0)
+            .then(|| delta as f64 / system_delta as f64 * cores as f64 * 100.0)
+    })();
+    let memory = &stats["memory_stats"];
+    let cache = ["total_inactive_file", "inactive_file", "cache"]
+        .iter()
+        .find_map(|key| memory["stats"][key].as_u64())
+        .unwrap_or(0);
+    let used = memory["usage"]
+        .as_u64()
+        .map(|used| used.saturating_sub(cache));
+    let limit = memory["limit"].as_u64();
+    let memory_percent = used
+        .zip(limit)
+        .filter(|(_, limit)| *limit > 0)
+        .map(|(used, limit)| used as f64 / limit as f64 * 100.0);
+    let network_sum = |field: &str| {
+        stats["networks"].as_object().map(|networks| {
+            networks
+                .values()
+                .filter_map(|v| v[field].as_u64())
+                .fold(0u64, u64::saturating_add)
+        })
+    };
+    let block_sum = |op: &str| {
+        stats["blkio_stats"]["io_service_bytes_recursive"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|v| {
+                        v["op"]
+                            .as_str()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(op))
+                    })
+                    .filter_map(|v| v["value"].as_u64())
+                    .fold(0u64, u64::saturating_add)
+            })
+    };
+    let network_io = network_sum("rx_bytes")
+        .zip(network_sum("tx_bytes"))
+        .map(|(rx, tx)| format!("{} / {}", human_bytes(rx), human_bytes(tx)));
+    let block_io = block_sum("read")
+        .zip(block_sum("write"))
+        .map(|(read, write)| format!("{} / {}", human_bytes(read), human_bytes(write)));
     json!({
-        "id": value["ID"].as_str(), "name": value["Name"].as_str(),
-        "cpu_percent": value["CPUPerc"].as_str(),
-        "memory_usage": value["MemUsage"].as_str(), "memory_percent": value["MemPerc"].as_str(),
-        "network_io": value["NetIO"].as_str(), "block_io": value["BlockIO"].as_str(),
-        "pids": value["PIDs"].as_str(),
+        "id": container["Id"].as_str(),
+        "name": container["Names"][0].as_str().unwrap_or("unknown").trim_start_matches('/'),
+        "sampled_at": stats["read"].as_str(),
+        "cpu_percent": cpu_percent.map(|p|format!("{p:.2}%")), "cpu_percent_value": cpu_percent,
+        "memory_usage": used.zip(limit).map(|(used,limit)|format!("{} / {}", human_bytes(used), human_bytes(limit))),
+        "memory_usage_bytes": used, "memory_limit_bytes": limit,
+        "memory_percent": memory_percent.map(|p|format!("{p:.2}%")),
+        "network_io": network_io, "block_io": block_io,
+        "network_rx_bytes": network_sum("rx_bytes"), "network_tx_bytes": network_sum("tx_bytes"),
+        "block_read_bytes": block_sum("read"), "block_write_bytes": block_sum("write"),
+        "memory_percent_value": memory_percent, "pids_current": stats["pids_stats"]["current"].as_u64(),
+        "pids": stats["pids_stats"]["current"].as_u64().map(|n|n.to_string()),
     })
 }
 

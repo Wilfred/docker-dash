@@ -11,11 +11,11 @@ the box itself.
 
 ## Run
 
-Requires a current stable Rust toolchain (edition 2024), the Docker CLI on
-`PATH`, and permission to query a running local Docker daemon:
+Requires a current stable Rust toolchain (edition 2024), a Unix host, and
+permission to access a running local Docker daemon's Unix socket. The application
+uses the Docker Engine HTTP API directly; no Docker CLI or subprocesses are used:
 
 ```sh
-docker version
 cargo run --release
 ```
 
@@ -30,9 +30,9 @@ DOCKER_DASH_BIND=127.0.0.1:9090 cargo run --release
 
 The dashboard has no authentication. Keep its default loopback binding or put it
 behind an authenticated reverse proxy before exposing it to other machines.
-The application only issues read commands (`version`, `ps`, `container inspect`,
-`image inspect`, `info`, `stats`, and `logs`); access to the Docker socket itself still grants
-broad host privileges.
+The application only issues GET requests to the Docker Engine API (version,
+info, container/image inspection, stats, and logs). Access to the Docker socket
+itself still grants broad host privileges; the dashboard is not a socket proxy.
 
 ## Dashboard behavior
 
@@ -42,7 +42,7 @@ broad host privileges.
   their last start/finish timestamps and exit code, and never-started containers
   are marked explicitly. A tag is the image's
   declared version, not a detected application version. Untagged names show
-  `latest (implicit)`.
+  `latest (implicit)`; image IDs without a repository tag show `untagged`.
 - Shows published port bindings, configured bindings on inactive containers,
   exposed-only ports, network mode, network attachments, and container IPs.
   Host networking shares host ports; Docker does not report those listening
@@ -52,13 +52,15 @@ broad host privileges.
   CPU and process limits.
 - **Resource usage** (`/usage`, `/api/usage`) samples running containers on
   demand: CPU, memory, process count, and network/block I/O counters. It does
-  not poll in the background. The JSON uses Docker's unit-bearing strings.
+  not poll in the background. CPU percentages use Docker CPU/system deltas
+  and online CPU count; memory excludes inactive file cache on Linux. The JSON
+  includes formatted units and numeric CPU/memory values.
 - Shows the Docker host name, OS, kernel, architecture, CPU count and memory
-  from `docker info` (selected fields only).
+  from the Engine info endpoint (selected fields only).
 - Shows the Docker **server** version and Linux host uptime from `/proc/uptime`.
   Host uptime displays as unavailable on systems without that file.
 - Shows each container image's build/creation time in UTC, using `Created` from
-  `docker image inspect` against the container's immutable image ID. This is
+  the image inspection API against the container's immutable image ID. This is
   image metadata, not the time it was pulled or the container was started, and
   does not depend on where a mutable tag such as `latest` points now. Missing
   or invalid timestamps display as unavailable (JSON `null`). Removed images
@@ -74,17 +76,24 @@ broad host privileges.
   captured. Select **Latest** if a snapshot expires. Rotation can remove logs
   before capture; the dashboard cannot recover logs Docker no longer retains.
   Equal timestamps preserve stream order; their order across stdout and stderr
-  cannot be determined from CLI output.
-- Docker commands time out after 15 seconds. Output is limited to 4 MiB per
-  stream per command; unusually large logs produce an error rather than being
+  is not distinguished when timestamps are identical.
+- Docker API requests time out after 15 seconds. Responses are limited to
+  4 MiB per request; unusually large logs produce an error rather than being
   silently truncated. Docker connection errors and unsupported logging drivers
-  appear in the UI. At most four Docker commands run concurrently; requests
+  appear in the UI. At most four Docker API requests run concurrently; requests
   waiting longer than five seconds receive a retryable HTTP 503.
 
-The Docker CLI inherits its usual context and environment, including
-`DOCKER_HOST`. Use a local Docker context to match this application's intended
-scope: host uptime always describes the machine running docker-dash, even if
-the CLI points at a remote daemon.
+The default socket is `/var/run/docker.sock`. To select another local socket
+(for example rootless Docker or Docker Desktop on macOS), set an absolute path:
+
+```sh
+DOCKER_DASH_SOCKET=/run/user/1000/docker.sock cargo run --release
+```
+
+API versions 1.40–1.56 are supported, negotiated against the daemon's reported
+range. Docker contexts, `DOCKER_HOST`, TCP/TLS endpoints, and Windows named pipes
+are not used. Host uptime always describes the machine running docker-dash;
+the OS/kernel/CPU/memory fields describe the Docker daemon host.
 
 ## Tailnet sharing and sensitive data
 
@@ -165,7 +174,11 @@ or start time for containers that have never started). Additional fields include
 `restart_count`, `restart_policy`, `restart_max_retries`, `network_mode`, `ports`
 (each with `container_port`, `published` and `configured` bindings), `networks`,
 `memory_limit_bytes`, `nano_cpus`, `cpu_quota`, `cpu_period`, `pids_limit`, and
-`log_driver`. Zero memory/CPU limits mean no explicit Docker limit; process
+`log_driver`. Usage responses also include `cpu_percent_value`, `memory_usage_bytes`, and
+`memory_limit_bytes`, `memory_percent_value`, `network_rx_bytes`,
+`network_tx_bytes`, `block_read_bytes`, `block_write_bytes`, `pids_current`,
+and the per-container `sampled_at` timestamp; missing samples are null instead of NaN or infinity.
+Zero memory/CPU limits mean no explicit Docker limit; process
 limits of zero/negative mean unlimited, and null means the Docker default.
 Logs return `lines`, `page` (zero-based), `until` (the snapshot token), `has_older`,
 and `history_limit_reached`. Follow the HTML page's **This page as JSON** link,
@@ -181,10 +194,12 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Tests use a simulated Docker executable and exercise container metadata, empty
-hosts, merged and paginated logs, snapshot isolation, input validation, embedded
-assets, and Docker failures without requiring daemon access. CLI fixture tests
-run on Unix platforms.
+Integration tests run a mock Docker Engine HTTP server over temporary Unix
+sockets. They verify version negotiation, read-only requests, all container
+states, missing images, metadata allowlists, secret masking and cached pages,
+TTY and multiplexed logs (including split UTF-8), response limits, usage
+calculations and HTML rendering without requiring a Docker daemon. The CI
+smoke test also exercises the image against a real Docker socket.
 
 ## Container image
 
@@ -211,7 +226,7 @@ docker run --detach --name docker-dash \
   ghcr.io/wilfred/docker-dash:latest
 ```
 
-The image contains the Docker CLI and runs as UID/GID `10001:10001`.
+The image runs as UID/GID `10001:10001` and contains no Docker CLI.
 `--group-add` grants access using the socket's host group. A read-only bind mount
 still allows Docker API calls; it does not restrict Docker socket privileges.
 For rootless Docker, substitute its socket path and group. Host uptime inside

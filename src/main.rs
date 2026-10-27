@@ -9,6 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse::<bool>()
             .map_err(|_| "DOCKER_DASH_LOGS must be true or false")?;
     }
+    state.socket_path = std::env::var("DOCKER_DASH_SOCKET").unwrap_or(state.socket_path);
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("docker-dash listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app(state))

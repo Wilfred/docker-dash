@@ -10,15 +10,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
+use tokio::task::JoinSet;
 
 mod diagnostics;
+mod engine;
 mod web;
 
 const PAGE_SIZE: usize = 100;
@@ -26,20 +25,22 @@ const MAX_PAGE: usize = 99;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub docker: String,
+    pub socket_path: String,
     pub uptime_path: String,
     pub logs_enabled: bool,
     snapshots: Arc<Mutex<VecDeque<Snapshot>>>,
-    commands: Arc<Semaphore>,
+    requests: Arc<Semaphore>,
+    api: Arc<OnceCell<(String, Value)>>,
 }
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            docker: "docker".into(),
+            socket_path: "/var/run/docker.sock".into(),
             uptime_path: "/proc/uptime".into(),
             logs_enabled: true,
             snapshots: Arc::default(),
-            commands: Arc::new(Semaphore::new(4)),
+            requests: Arc::new(Semaphore::new(4)),
+            api: Arc::default(),
         }
     }
 }
@@ -96,60 +97,6 @@ struct Snapshot {
     until: String,
     lines: Vec<String>,
     created: Instant,
-}
-
-async fn read_output(reader: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
-    const MAX_BYTES: u64 = 4 * 1024 * 1024;
-    let mut bytes = Vec::new();
-    reader.take(MAX_BYTES + 1).read_to_end(&mut bytes).await?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(std::io::Error::other(
-            "Docker output exceeds 4 MiB per stream; narrow the container logs",
-        ));
-    }
-    Ok(bytes)
-}
-
-async fn docker_output(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
-    let _permit = tokio::time::timeout(Duration::from_secs(5), state.commands.acquire())
-        .await
-        .map_err(|_| unavailable("Dashboard is busy. Retry the request."))?
-        .map_err(|_| unavailable("Dashboard is shutting down"))?;
-    let mut cmd = Command::new(&state.docker);
-    cmd.args(args).stdin(Stdio::null()).kill_on_drop(true);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| unavailable(format!("Cannot run Docker CLI: {e}")))?;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let (status, stdout, stderr) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::try_join!(child.wait(), read_output(stdout), read_output(stderr))
-    })
-    .await
-    .map_err(|_| unavailable("Docker command timed out after 15 seconds"))?
-    .map_err(|e| unavailable(format!("Cannot read Docker output: {e}")))?;
-    let result = std::process::Output {
-        status,
-        stdout,
-        stderr,
-    };
-    Ok(result)
-}
-async fn docker(state: &AppState, args: &[&str]) -> Result<std::process::Output, ApiError> {
-    let result = docker_output(state, args).await?;
-    if !result.status.success() {
-        let message = String::from_utf8_lossy(&result.stderr);
-        return Err(unavailable(format!(
-            "Docker: {}",
-            message.chars().take(2000).collect::<String>().trim()
-        )));
-    }
-    Ok(result)
-}
-async fn docker_json(state: &AppState, args: &[&str]) -> Result<Value, ApiError> {
-    serde_json::from_slice(&docker(state, args).await?.stdout)
-        .map_err(|e| unavailable(format!("Invalid Docker response: {e}")))
 }
 
 #[derive(Serialize)]
@@ -234,87 +181,110 @@ fn container(value: &Value, images: &[Value]) -> Container {
         diagnostics: diagnostics::container_details(value),
     }
 }
-async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
-    let (version, ids, host) = tokio::try_join!(
-        docker_json(&state, &["version", "--format", "{{json .}}"]),
-        docker(&state, &["ps", "--all", "--quiet", "--no-trunc"]),
-        docker_json(&state, &["info", "--format", "{{json .}}"])
-    )?;
-    let ids = String::from_utf8_lossy(&ids.stdout);
-    let mut containers = Vec::new();
-    if !ids.trim().is_empty() {
-        let mut args = vec!["container", "inspect"];
-        args.extend(ids.split_whitespace());
-        let inspected = docker_json(&state, &args).await?;
-        let inspected = inspected
-            .as_array()
-            .ok_or_else(|| unavailable("Expected a container array"))?;
-        // Resolve immutable image IDs, not tags: :latest may now refer to a
-        // different image than the one this container is actually running.
-        let mut image_ids: Vec<_> = inspected
-            .iter()
-            .filter_map(|container| container["Image"].as_str())
-            .collect();
-        image_ids.sort_unstable();
-        image_ids.dedup();
-        let images = if image_ids.is_empty() {
-            Vec::new()
+async fn container_list(state: &AppState, all: bool) -> Result<Vec<Value>, ApiError> {
+    let value = engine::json(
+        state,
+        if all {
+            "/containers/json?all=1"
         } else {
-            let mut args = vec!["image", "inspect"];
-            args.extend(image_ids);
-            // Old containers may reference removed images. Docker returns the
-            // available image records even when some IDs cannot be inspected.
-            let output = docker_output(&state, &args).await?;
-            let images: Value = serde_json::from_slice(&output.stdout)
-                .map_err(|e| unavailable(format!("Invalid Docker image response: {e}")))?;
-            images
-                .as_array()
-                .ok_or_else(|| unavailable("Expected an image array"))?
-                .clone()
-        };
-        containers = inspected
-            .iter()
-            .map(|value| container(value, &images))
-            .collect();
-        if !state.logs_enabled {
-            for container in &mut containers {
-                container.diagnostics["state_error"] = Value::Null;
-            }
-        }
-        containers.sort_by(|a, b| a.name.cmp(&b.name));
+            "/containers/json"
+        },
+    )
+    .await?;
+    let list = value
+        .as_array()
+        .ok_or_else(|| unavailable("Expected a container list"))?;
+    if list.iter().any(|c| !c["Id"].as_str().is_some_and(valid_id)) {
+        return Err(unavailable("Docker returned an invalid container ID"));
     }
+    Ok(list.clone())
+}
+async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
+    let (version, list, host) = tokio::try_join!(
+        engine::version(&state),
+        container_list(&state, true),
+        engine::json(&state, "/info")
+    )?;
+    let mut pending = JoinSet::new();
+    for c in list {
+        let state = state.clone();
+        let id = c["Id"].as_str().unwrap().to_owned();
+        pending.spawn(async move { engine::json(&state, &format!("/containers/{id}/json")).await });
+    }
+    let mut inspected = Vec::new();
+    while let Some(result) = pending.join_next().await {
+        match result.map_err(|_| unavailable("Container inspection interrupted"))? {
+            Ok(value) => inspected.push(value),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => {} // Removed during collection.
+            Err(error) => return Err(error),
+        }
+    }
+    let mut image_ids: Vec<_> = inspected
+        .iter()
+        .filter_map(|c| c["Image"].as_str())
+        .collect();
+    image_ids.sort_unstable();
+    image_ids.dedup();
+    let mut pending = JoinSet::new();
+    for id in image_ids {
+        let digest = id.strip_prefix("sha256:").unwrap_or(id);
+        if digest.is_empty() || digest.len() > 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(unavailable("Docker returned an invalid image ID"));
+        }
+        let state = state.clone();
+        let path = format!("/images/{id}/json");
+        pending.spawn(async move { engine::json(&state, &path).await });
+    }
+    let mut images = Vec::new();
+    while let Some(result) = pending.join_next().await {
+        match result.map_err(|_| unavailable("Image inspection interrupted"))? {
+            Ok(value) => images.push(value),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let mut containers: Vec<_> = inspected
+        .iter()
+        .map(|value| container(value, &images))
+        .collect();
+    if !state.logs_enabled {
+        for c in &mut containers {
+            c.diagnostics["state_error"] = Value::Null;
+        }
+    }
+    containers.sort_by(|a, b| a.name.cmp(&b.name));
     let uptime = tokio::fs::read_to_string(&state.uptime_path)
         .await
         .ok()
         .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok());
-    Ok(Json(json!({
-        "docker_version": version["Server"]["Version"],
-        "host": diagnostics::host_details(&host),
-        "logs_enabled": state.logs_enabled,
-        "host_uptime_seconds": uptime,
-        "containers": containers,
-        "checked_at": Utc::now().to_rfc3339(),
-    })))
+    Ok(Json(
+        json!({"docker_version": version["Version"], "host": diagnostics::host_details(&host),
+        "logs_enabled": state.logs_enabled, "host_uptime_seconds": uptime, "containers": containers,
+        "checked_at": Utc::now().to_rfc3339()}),
+    ))
 }
-
 async fn usage(State(state): State<AppState>) -> ApiResult<Value> {
-    let output = docker(
-        &state,
-        &[
-            "stats",
-            "--no-stream",
-            "--no-trunc",
-            "--format",
-            "{{json .}}",
-        ],
-    )
-    .await?;
-    let containers = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<Value>(line).map(|value| diagnostics::usage(&value)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| unavailable("Invalid Docker usage response"))?;
+    let list = container_list(&state, false).await?;
+    let mut pending = JoinSet::new();
+    for c in list {
+        let state = state.clone();
+        pending.spawn(async move {
+            let id = c["Id"].as_str().unwrap();
+            let stats =
+                engine::json(&state, &format!("/containers/{id}/stats?stream=false")).await?;
+            Ok::<_, ApiError>(diagnostics::usage(&c, &stats))
+        });
+    }
+    let mut containers = Vec::new();
+    while let Some(result) = pending.join_next().await {
+        match result.map_err(|_| unavailable("Usage collection interrupted"))? {
+            Ok(value) => containers.push(value),
+            Err(ApiError(StatusCode::NOT_FOUND | StatusCode::CONFLICT, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    containers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(
         json!({"checked_at": Utc::now().to_rfc3339(), "containers": containers}),
     ))
@@ -381,20 +351,19 @@ async fn logs(
         // Capture once: Docker may apply --tail before --until. Re-reading for
         // each page could otherwise skip entries as new logs arrive.
         let until = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let tail = ((MAX_PAGE + 1) * PAGE_SIZE + 1).to_string();
-        let inspected = docker_json(&state, &["container", "inspect", &id]).await?;
-        let secrets = diagnostics::secret_values(
-            inspected
-                .as_array()
-                .ok_or_else(|| unavailable("Expected a container array"))?,
-        );
-        let output = docker_output(&state, &["logs", "--timestamps", "--tail", &tail, &id]).await?;
-        if !output.status.success() {
-            return Err(unavailable(
-                "Docker could not read logs. Check the container and logging driver.",
-            ));
-        }
-        let lines: Vec<String> = [&output.stdout, &output.stderr]
+        let tail = (MAX_PAGE + 1) * PAGE_SIZE + 1;
+        let inspected = engine::json(&state, &format!("/containers/{id}/json")).await?;
+        let secrets = diagnostics::secret_values(std::slice::from_ref(&inspected));
+        let output = engine::get(
+            &state,
+            &format!("/containers/{id}/logs?stdout=1&stderr=1&timestamps=1&tail={tail}"),
+        )
+        .await?;
+        let streams = engine::log_streams(
+            &output,
+            inspected["Config"]["Tty"].as_bool().unwrap_or(false),
+        )?;
+        let lines: Vec<String> = streams
             .iter()
             .flat_map(|bytes| {
                 diagnostics::redact(&String::from_utf8_lossy(bytes), &secrets)
@@ -425,12 +394,6 @@ async fn logs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[tokio::test]
-    async fn command_output_is_bounded() {
-        assert_eq!(read_output(&b"hello"[..]).await.unwrap(), b"hello");
-        let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
-        assert!(read_output(oversized.as_slice()).await.is_err());
-    }
     #[test]
     fn versions_handle_registry_ports_and_digests() {
         assert_eq!(image_version("localhost:5000/team/app:1.2"), "1.2");
