@@ -52,7 +52,7 @@ fn bytes(value: &Value) -> String {
     }
 }
 fn diagnostics_fields(c: &Value) -> String {
-    let mut content = "<h4>Diagnostics</h4><dl>".to_owned();
+    let mut content = "<h3>Diagnostics</h3><dl>".to_owned();
     for (label, key) in [
         ("Created at (UTC)", "created_at"),
         ("Health", "health_status"),
@@ -100,7 +100,7 @@ fn diagnostics_fields(c: &Value) -> String {
         None => "Default".into(),
     };
     field(&mut content, "Process limit", &pids);
-    content.push_str("</dl><h4>Ports</h4>");
+    content.push_str("</dl><h3>Ports</h3>");
     if c["network_mode"] == "host" {
         content.push_str("<p>Host networking: listens directly on the host. Docker does not report port bindings.</p>");
     }
@@ -147,7 +147,7 @@ fn diagnostics_fields(c: &Value) -> String {
         }
         content.push_str("</ul>");
     }
-    content.push_str("<h4>Networks</h4>");
+    content.push_str("<h3>Networks</h3>");
     let networks = c["networks"].as_array().unwrap();
     if networks.is_empty() {
         content.push_str("<p>No network attachments.</p>");
@@ -190,13 +190,29 @@ fn error(error: ApiError, recovery: &str) -> Response {
     )
 }
 
+fn short_duration(value: &Value) -> String {
+    let Some(seconds) = value.as_f64().filter(|n| n.is_finite() && *n >= 0.0) else {
+        return "Not running".into();
+    };
+    let seconds = seconds as u64;
+    if seconds >= 86400 {
+        format!("{}d {}h", seconds / 86400, seconds / 3600 % 24)
+    } else if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 pub(super) async fn index(State(state): State<AppState>) -> Response {
     let data = match overview(State(state)).await {
         Ok(Json(data)) => data,
         Err(err) => return error(err, "<p><a href=\"/\">Retry overview</a></p>"),
     };
-    let containers = data["containers"].as_array().unwrap();
     let mut content = "<h2>Host</h2><dl>".to_owned();
+    field(&mut content, "Name", &scalar(&data["host"]["name"]));
     field(
         &mut content,
         "Docker version",
@@ -205,85 +221,99 @@ pub(super) async fn index(State(state): State<AppState>) -> Response {
     field(
         &mut content,
         "Host uptime",
-        &duration(&data["host_uptime_seconds"]),
+        &data["host_uptime_seconds"]
+            .as_f64()
+            .map(|_| short_duration(&data["host_uptime_seconds"]))
+            .unwrap_or_else(|| "Unavailable".into()),
     );
     field(
         &mut content,
         "Checked at (UTC)",
         &scalar(&data["checked_at"]),
     );
-    for (label, key) in [
-        ("Docker host", "name"),
-        ("Operating system", "operating_system"),
-        ("Kernel", "kernel_version"),
-        ("Architecture", "architecture"),
-        ("Host CPUs", "cpus"),
-    ] {
-        field(&mut content, label, &scalar(&data["host"][key]));
-    }
-    field(
-        &mut content,
-        "Host memory",
-        &bytes(&data["host"]["memory_bytes"]),
-    );
+    let containers = data["containers"].as_array().unwrap();
     content.push_str(&format!(
         "</dl><p><a href=\"/\">Refresh</a></p><h2>Containers ({})</h2>",
         containers.len()
     ));
     if containers.is_empty() {
         content.push_str("<p>No containers.</p>");
+    } else {
+        content.push_str("<div class=\"table-wrap\"><table><thead><tr><th scope=\"col\">Container</th><th scope=\"col\">Status</th><th scope=\"col\">Image</th><th scope=\"col\">Image built (UTC)</th><th scope=\"col\">Uptime</th><th scope=\"col\">Logs</th></tr></thead><tbody>");
+        for c in containers {
+            let id = text(&c["id"]);
+            let mut status = scalar(&c["status"]);
+            if let Some(code) = c["exit_code"].as_i64() {
+                status.push_str(&format!(" (exit {code})"));
+            }
+            if let Some(health) = c["health_status"]
+                .as_str()
+                .filter(|health| *health != "healthy")
+            {
+                status.push_str(&format!(" / {health}"));
+            }
+            if c["oom_killed"] == true {
+                status.push_str(" / OOM killed");
+            }
+            content.push_str(&format!("<tr><th scope=\"row\"><a href=\"/containers/{id}\">{}</a></th><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"/containers/{id}/logs\" aria-label=\"Logs for {}\">Logs</a></td></tr>", text(&c["name"]), escape(&status), text(&c["image"]), text(&c["image_created_at"]), short_duration(&c["uptime_seconds"]), text(&c["name"])));
+        }
+        content.push_str("</tbody></table></div>");
     }
-    for c in containers {
-        let id = text(&c["id"]);
-        let started_at = c["started_at"]
-            .as_str()
-            .map(escape)
-            .unwrap_or_else(|| "Never started".into());
-        let finished_at = c["finished_at"]
-            .as_str()
-            .map(escape)
-            .unwrap_or_else(|| "Not finished".into());
-        let exit_code = c["exit_code"]
+    document(StatusCode::OK, content)
+}
+
+pub(super) async fn container_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let c = match container_json(State(state), Path(id)).await {
+        Ok(Json(data)) => data,
+        Err(err) => return error(err, "<p><a href=\"/\">Host overview</a></p>"),
+    };
+    let id = text(&c["id"]);
+    let mut content = format!(
+        "<h2>{}</h2><p><a href=\"/api/containers/{id}\">Container JSON</a> · <a href=\"/containers/{id}/logs\">Logs</a> · <a href=\"/api/containers/{id}/logs\">Logs JSON</a></p><dl>",
+        text(&c["name"])
+    );
+    for (label, key) in [
+        ("ID", "id"),
+        ("Image", "image"),
+        ("Image ID", "image_id"),
+        ("Version / tag", "version"),
+        ("Image built (UTC)", "image_created_at"),
+        ("Status", "status"),
+    ] {
+        field(&mut content, label, &scalar(&c[key]));
+    }
+    field(
+        &mut content,
+        "Started at (UTC)",
+        c["started_at"].as_str().unwrap_or("Never started"),
+    );
+    field(
+        &mut content,
+        "Finished at (UTC)",
+        c["finished_at"].as_str().unwrap_or("Not finished"),
+    );
+    field(
+        &mut content,
+        "Exit code",
+        &c["exit_code"]
             .as_i64()
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "Not exited".into());
-        let uptime = if c["uptime_seconds"].is_null() {
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "Not exited".into()),
+    );
+    field(
+        &mut content,
+        "Uptime",
+        &if c["uptime_seconds"].is_null() {
             "Not running".into()
         } else {
             duration(&c["uptime_seconds"])
-        };
-        let details = diagnostics_fields(c);
-        let log_links = if data["logs_enabled"] == true {
-            format!(
-                "<p><a href=\"/containers/{id}/logs\">Logs for {}</a> · <a href=\"/api/containers/{id}/logs\">Logs JSON for {}</a></p>",
-                text(&c["name"]),
-                text(&c["name"])
-            )
-        } else {
-            "<p>Log access disabled.</p>".into()
-        };
-        content.push_str(&format!(
-            "<section class=\"container\" aria-label=\"Container {}\"><h3>{}</h3><dl>\
-             <dt>ID</dt><dd>{id}</dd>\
-             <dt>Image</dt><dd>{}</dd>\
-             <dt>Image ID</dt><dd>{}</dd>\
-             <dt>Version / tag</dt><dd>{}</dd>\
-             <dt>Image built (UTC)</dt><dd>{}</dd>\
-             <dt>Status</dt><dd>{}</dd>\
-             <dt>Started at (UTC)</dt><dd>{started_at}</dd>\
-             <dt>Finished at (UTC)</dt><dd>{finished_at}</dd>\
-             <dt>Exit code</dt><dd>{exit_code}</dd>\
-             <dt>Uptime</dt><dd>{uptime}</dd></dl>{details}\
-             {log_links}</section>",
-            text(&c["name"]),
-            text(&c["name"]),
-            text(&c["image"]),
-            text(&c["image_id"]),
-            text(&c["version"]),
-            text(&c["image_created_at"]),
-            text(&c["status"])
-        ));
-    }
+        },
+    );
+    content.push_str("</dl>");
+    content.push_str(&diagnostics_fields(&c));
     document(StatusCode::OK, content)
 }
 

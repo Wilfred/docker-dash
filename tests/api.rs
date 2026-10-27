@@ -258,13 +258,21 @@ async fn overview_includes_all_states_and_missing_images() {
     assert_eq!(status, StatusCode::OK);
     for text in [
         "Containers (3)",
-        "Never started",
         "Not running",
-        "Exit code</dt><dd>2",
-        "Image built (UTC)</dt><dd>2025-12-01T12:30:00Z",
+        "exit 2",
+        "2025-12-01T12:30:00Z",
+        "href=\"/containers/bbbbbbbbbbbb\"",
     ] {
         assert!(body.contains(text), "{text}");
     }
+    assert!(!body.contains("Health failures"));
+    assert!(!body.contains("Memory limit"));
+    assert!(!body.contains("Kernel"));
+    let (_, created) = html(f.app(), "/containers/bbbbbbbbbbbb").await;
+    assert!(created.contains("Never started"));
+    let (_, exited) = html(f.app(), "/containers/cccccccccccc").await;
+    assert!(exited.contains("Exit code</dt><dd>2"));
+    assert!(exited.contains("2025-01-01T00:00:05Z"));
     assert!(!body.contains("0001-01-01"));
     assert!(!body.contains("<script"));
     assert!(!body.contains("<input"));
@@ -289,7 +297,17 @@ async fn diagnostic_allowlist_excludes_sensitive_fields() {
     assert_eq!(c["ports"][0]["published"], json!([]));
     assert_eq!(c["ports"][2]["published"][0]["host_ip"], "127.0.0.1");
     assert_eq!(c["networks"][0]["ipv4_address"], "172.18.0.2");
-    let (_, body) = html(f.app(), "/").await;
+    let (_, detail) = get(f.app(), "/api/containers/aaaaaaaaaaaa").await;
+    for key in [
+        "id",
+        "ports",
+        "state_error",
+        "restart_count",
+        "image_created_at",
+    ] {
+        assert_eq!(detail[key], c[key]);
+    }
+    let (_, body) = html(f.app(), "/containers/aaaaaaaaaaaa").await;
     for expected in [
         "unhealthy",
         "127.0.0.1",
@@ -319,6 +337,10 @@ async fn diagnostic_allowlist_excludes_sensitive_fields() {
         "HOST_SECRET",
     ] {
         assert!(!data.to_string().contains(secret), "JSON exposed {secret}");
+        assert!(
+            !detail.to_string().contains(secret),
+            "Detail JSON exposed {secret}"
+        );
         assert!(!body.contains(secret), "HTML exposed {secret}");
     }
 }
@@ -402,26 +424,41 @@ async fn tty_and_split_utf8_logs_are_supported_and_html_is_escaped() {
     );
 }
 #[tokio::test]
-async fn logs_can_be_disabled_even_for_cached_pages() {
+async fn minimal_home_links_to_focused_details_and_logs() {
     let f = Fixture::new().await;
-    let mut state = f.state();
-    let (_, data) = get(app(state.clone()), "/api/containers/aaaaaaaaaaaa/logs").await;
-    state.logs_enabled = false;
-    let app = app(state);
-    let url = format!(
-        "/api/containers/aaaaaaaaaaaa/logs?until={}",
-        data["until"].as_str().unwrap()
+    let app = f.app();
+    let (_, home) = html(app.clone(), "/").await;
+    let uri = link(&home, "web");
+    assert_eq!(uri, "/containers/aaaaaaaaaaaa");
+    assert!(!home.contains("<h3>Diagnostics"));
+    assert!(!home.contains("state_error"));
+    f.mock.lock().unwrap().requests.clear();
+    let (status, details) = html(app.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(details.contains("<h3>Diagnostics"));
+    let (status, data) = get(app.clone(), &link(&details, "Container JSON")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(data["restart_count"], 7);
+    assert!(
+        !f.mock
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|path| path.contains("/containers/json"))
     );
-    assert_eq!(get(app.clone(), &url).await.0, StatusCode::FORBIDDEN);
     assert_eq!(
-        html(app.clone(), "/containers/aaaaaaaaaaaa/logs").await.0,
-        StatusCode::FORBIDDEN
+        html(app.clone(), &link(&details, "Logs")).await.0,
+        StatusCode::OK
     );
-    let (_, data) = get(app.clone(), "/api/overview").await;
-    assert!(data["containers"][0]["state_error"].is_null());
-    let (_, body) = html(app, "/").await;
-    assert!(body.contains("Log access disabled."));
-    assert!(!body.contains("href=\"/containers/aaaaaaaaaaaa/logs\""));
+    assert_eq!(
+        get(app.clone(), "/api/containers/--help").await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        html(app, "/containers/bbbbbbbbbbbb").await.0,
+        StatusCode::NOT_FOUND
+    );
 }
 #[tokio::test]
 async fn usage_calculations_are_bounded_and_allowlisted() {

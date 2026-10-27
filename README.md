@@ -36,6 +36,12 @@ itself still grants broad host privileges; the dashboard is not a socket proxy.
 
 ## Dashboard behavior
 
+The home page is a compact index: host name, Docker version, uptime, check time,
+and one row per container with status, image, build time, uptime, and links.
+Click a container name for its diagnostic details. `/api/containers/<id>` returns
+the same selected data for one container; `/api/overview` retains the full host
+and container inventory for structured bulk reads.
+
 - Lists all containers, including created, running, paused, and exited ones,
   with their name, ID, image reference, image tag or digest, and status.
   Uptime is shown only for running/paused containers; stopped containers show
@@ -133,23 +139,14 @@ Masking occurs before snapshots are cached and applies to HTML and JSON.
 
 This is best-effort masking, not a guarantee that arbitrary log/error messages
 are secret-free: encoded values, file-based secrets, unusually named variables,
-and unrelated credentials may remain. Treat log access as privileged. To share
-metadata and usage without exposing application logs, set:
-
-```sh
-DOCKER_DASH_LOGS=false cargo run --release
-# For the image, add: --env DOCKER_DASH_LOGS=false
-```
-
-Log links and free-form Docker state errors are removed; both HTML and JSON log
-endpoints return HTTP 403,
-including requests for existing snapshots. `DOCKER_DASH_LOGS` accepts only
-`true` or `false`; the default is `true`. Responses are uncached, cannot be
+and unrelated credentials may remain. Logs are always available and should be
+restricted to trusted tailnet users/devices. Responses are uncached, cannot be
 framed, forbid scripts, omit referrers, and ask crawlers not to index them.
 
 ## Agent access
 
-The HTML overview (`/`) and log pages (`/containers/<id>/logs`) include their data
+The compact HTML overview (`/`), container detail pages (`/containers/<id>`),
+and log pages (`/containers/<id>/logs`) include their data
 in the response body, so HTTP clients and agents can read them without a browser
 runtime. Log pagination uses ordinary links that keep the snapshot fixed.
 
@@ -158,13 +155,14 @@ For structured data:
 ```sh
 curl --fail http://127.0.0.1:8080/api/overview
 curl --fail http://127.0.0.1:8080/api/usage
+curl --fail http://127.0.0.1:8080/api/containers/CONTAINER_ID
 curl --fail "http://127.0.0.1:8080/api/containers/CONTAINER_ID/logs"
 ```
 
 Replace `CONTAINER_ID` with a container ID from the overview (and quote the URL in a
 shell if using query parameters). The overview includes `checked_at`,
 `docker_version`, `host` (Docker host details), `host_uptime_seconds`,
-`logs_enabled`, and `containers`. Each container includes
+and `containers`. Each container includes
 `id`, `name`, `image`, `version`, `image_id`, `image_created_at` (UTC), `status`,
 `started_at`, `finished_at`, `exit_code`, and `uptime_seconds`. Lifecycle
 fields are `null` when not applicable (for example, uptime for exited containers

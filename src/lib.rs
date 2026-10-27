@@ -27,7 +27,6 @@ const MAX_PAGE: usize = 99;
 pub struct AppState {
     pub socket_path: String,
     pub uptime_path: String,
-    pub logs_enabled: bool,
     snapshots: Arc<Mutex<VecDeque<Snapshot>>>,
     requests: Arc<Semaphore>,
     api: Arc<OnceCell<(String, Value)>>,
@@ -37,7 +36,6 @@ impl Default for AppState {
         Self {
             socket_path: "/var/run/docker.sock".into(),
             uptime_path: "/proc/uptime".into(),
-            logs_enabled: true,
             snapshots: Arc::default(),
             requests: Arc::new(Semaphore::new(4)),
             api: Arc::default(),
@@ -48,6 +46,7 @@ impl Default for AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(web::index))
+        .route("/containers/{id}", get(web::container_detail))
         .route("/containers/{id}/logs", get(web::container_logs))
         .route(
             "/style.css",
@@ -61,6 +60,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/overview", get(overview))
         .route("/usage", get(web::usage))
         .route("/api/usage", get(usage))
+        .route("/api/containers/{id}", get(container_json))
         .route("/api/containers/{id}/logs", get(logs))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
@@ -181,6 +181,31 @@ fn container(value: &Value, images: &[Value]) -> Container {
         diagnostics: diagnostics::container_details(value),
     }
 }
+async fn inspect_image(state: &AppState, id: &str) -> Result<Value, ApiError> {
+    let digest = id.strip_prefix("sha256:").unwrap_or(id);
+    if digest.is_empty() || digest.len() > 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(unavailable("Docker returned an invalid image ID"));
+    }
+    engine::json(state, &format!("/images/{id}/json")).await
+}
+async fn container_json(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Value> {
+    if !valid_id(&id) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Invalid container ID".into(),
+        ));
+    }
+    let inspected = engine::json(&state, &format!("/containers/{id}/json")).await?;
+    let mut images = Vec::new();
+    if let Some(id) = inspected["Image"].as_str() {
+        match inspect_image(&state, id).await {
+            Ok(image) => images.push(image),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(json!(container(&inspected, &images))))
+}
 async fn container_list(state: &AppState, all: bool) -> Result<Vec<Value>, ApiError> {
     let value = engine::json(
         state,
@@ -227,14 +252,9 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
     image_ids.dedup();
     let mut pending = JoinSet::new();
     for id in image_ids {
-        let digest = id.strip_prefix("sha256:").unwrap_or(id);
-        if digest.is_empty() || digest.len() > 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(unavailable("Docker returned an invalid image ID"));
-        }
         let state = state.clone();
-        let path = format!("/images/{id}/json");
-        pending.spawn(async move { engine::json(&state, &path).await });
+        let id = id.to_owned();
+        pending.spawn(async move { inspect_image(&state, &id).await });
     }
     let mut images = Vec::new();
     while let Some(result) = pending.join_next().await {
@@ -248,11 +268,6 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
         .iter()
         .map(|value| container(value, &images))
         .collect();
-    if !state.logs_enabled {
-        for c in &mut containers {
-            c.diagnostics["state_error"] = Value::Null;
-        }
-    }
     containers.sort_by(|a, b| a.name.cmp(&b.name));
     let uptime = tokio::fs::read_to_string(&state.uptime_path)
         .await
@@ -260,7 +275,7 @@ async fn overview(State(state): State<AppState>) -> ApiResult<Value> {
         .and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok());
     Ok(Json(
         json!({"docker_version": version["Version"], "host": diagnostics::host_details(&host),
-        "logs_enabled": state.logs_enabled, "host_uptime_seconds": uptime, "containers": containers,
+        "host_uptime_seconds": uptime, "containers": containers,
         "checked_at": Utc::now().to_rfc3339()}),
     ))
 }
@@ -315,12 +330,6 @@ async fn logs(
     Path(id): Path<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Value> {
-    if !state.logs_enabled {
-        return Err(ApiError(
-            StatusCode::FORBIDDEN,
-            "Log access is disabled on this dashboard".into(),
-        ));
-    }
     let page = query.page.unwrap_or(0);
     if !valid_id(&id) || page > MAX_PAGE {
         return Err(ApiError(
