@@ -1,0 +1,114 @@
+name: CI and container image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Formatting
+            command: cargo fmt --all -- --check
+          - name: Clippy
+            command: cargo clippy --locked --all-targets --all-features -- -D warnings
+          - name: Tests
+            command: cargo test --locked --all-targets --all-features
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  image:
+    name: Build and publish image
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set image name and publishing policy
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          echo "name=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" != "pull_request" && "$REF" == "refs/heads/main" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Log in to GitHub Container Registry
+        if: steps.image.outputs.publish == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          load: true
+          tags: docker-dash:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test image with host Docker
+        run: |
+          docker run --rm --entrypoint docker docker-dash:smoke --version
+          container_id=$(docker run --detach \
+            --publish 127.0.0.1:8080:8080 \
+            --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+            --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+            docker-dash:smoke)
+          trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
+          curl --fail --retry 10 --retry-delay 1 --retry-connrefused http://127.0.0.1:8080/ > /dev/null
+          curl --fail http://127.0.0.1:8080/api/overview > /tmp/overview.json
+          jq --exit-status '.docker_version != null and (.containers | length > 0) and (.host_uptime_seconds > 0)' /tmp/overview.json
+          curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
+      - name: Publish latest and commit image
+        if: steps.image.outputs.publish == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          provenance: true

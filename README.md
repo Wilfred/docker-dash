@@ -73,3 +73,41 @@ Tests use a simulated Docker executable and exercise container metadata, empty
 hosts, merged and paginated logs, snapshot isolation, input validation, embedded
 assets, and Docker failures without requiring daemon access. CLI fixture tests
 run on Unix platforms.
+
+## Container image
+
+GitHub Actions runs formatting, Clippy (warnings are errors), and tests on pull
+requests and pushes to `main`. After all checks and an image smoke test pass,
+`main` publishes to GitHub Container Registry:
+
+- `ghcr.io/wilfred/docker-dash:latest`
+- `ghcr.io/wilfred/docker-dash:sha-<full-commit-sha>`
+
+Publishing uses the workflow's `GITHUB_TOKEN` with `packages: write`; no registry
+password secret is needed. Actions are pinned to commit hashes. Pull requests
+build and smoke-test the image without logging in or publishing. The first
+published package may be private; change its visibility in GitHub Packages if
+anonymous pulls are wanted, or authenticate with `docker login ghcr.io`.
+
+Run on a Linux Docker host:
+
+```sh
+docker run --detach --name docker-dash \
+  --publish 127.0.0.1:8080:8080 \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+  --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+  ghcr.io/wilfred/docker-dash:latest
+```
+
+The image contains the Docker CLI and runs as UID/GID `10001:10001`.
+`--group-add` grants access using the socket's host group. A read-only bind mount
+still allows Docker API calls; it does not restrict Docker socket privileges.
+For rootless Docker, substitute its socket path and group. Host uptime inside
+the image comes from the container's `/proc/uptime`, which reflects the Linux
+kernel host (the Docker VM on Docker Desktop).
+
+To build the image locally:
+
+```sh
+docker build --tag docker-dash:local .
+```
