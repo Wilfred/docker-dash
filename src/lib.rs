@@ -94,6 +94,7 @@ fn unavailable(message: impl Into<String>) -> ApiError {
 
 struct Snapshot {
     id: String,
+    name: String,
     until: String,
     lines: Vec<String>,
     created: Instant,
@@ -337,7 +338,7 @@ async fn logs(
             "Invalid container ID or page (allowed: 0–99)".into(),
         ));
     }
-    let (until, lines) = if let Some(until) = query.until {
+    let (until, name, lines) = if let Some(until) = query.until {
         let mut snapshots = state.snapshots.lock().unwrap();
         snapshots.retain(|s| s.created.elapsed() < Duration::from_secs(300));
         let snapshot = snapshots
@@ -349,7 +350,7 @@ async fn logs(
                     "Log snapshot expired. Select Latest to start again.".into(),
                 )
             })?;
-        (until, snapshot.lines.clone())
+        (until, snapshot.name.clone(), snapshot.lines.clone())
     } else {
         if page != 0 {
             return Err(ApiError(
@@ -363,6 +364,11 @@ async fn logs(
         let tail = (MAX_PAGE + 1) * PAGE_SIZE + 1;
         let inspected = engine::json(&state, &format!("/containers/{id}/json")).await?;
         let secrets = diagnostics::secret_values(std::slice::from_ref(&inspected));
+        let name = inspected["Name"]
+            .as_str()
+            .unwrap_or("unnamed")
+            .trim_start_matches('/')
+            .to_owned();
         let output = engine::get(
             &state,
             &format!("/containers/{id}/logs?stdout=1&stderr=1&timestamps=1&tail={tail}"),
@@ -388,15 +394,16 @@ async fn logs(
         }
         snapshots.push_back(Snapshot {
             id,
+            name: name.clone(),
             until: until.clone(),
             lines: lines.clone(),
             created: Instant::now(),
         });
-        (until, lines)
+        (until, name, lines)
     };
     let (lines, has_older) = paginate(lines, page);
     Ok(Json(
-        json!({"lines": lines, "page": page, "until": until, "has_older": has_older, "history_limit_reached": page == MAX_PAGE}),
+        json!({"name": name, "lines": lines, "page": page, "until": until, "has_older": has_older, "history_limit_reached": page == MAX_PAGE}),
     ))
 }
 

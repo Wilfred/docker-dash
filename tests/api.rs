@@ -350,6 +350,7 @@ async fn multiplexed_logs_are_redacted_before_snapshot_pagination() {
     let app = f.app();
     let (status, first) = get(app.clone(), "/api/containers/aaaaaaaaaaaa/logs").await;
     assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["name"], "web");
     assert_eq!(first["lines"].as_array().unwrap().len(), 100);
     assert_eq!(first["has_older"], true);
     assert!(!first.to_string().contains("ENV_SECRET"));
@@ -382,6 +383,8 @@ async fn multiplexed_logs_are_redacted_before_snapshot_pagination() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("[REDACTED]"));
     assert!(!body.contains("ENV_SECRET"));
+    assert!(body.contains("<h2>Logs: web</h2>"));
+    assert_eq!(link(&body, "web"), "/containers/aaaaaaaaaaaa");
     assert_eq!(
         get(app.clone(), &link(&body, "This page as JSON")).await.1["page"],
         1
@@ -473,12 +476,9 @@ async fn usage_calculations_are_bounded_and_allowlisted() {
     assert_eq!(c["network_io"], "1.0 KiB / 2.0 KiB");
     assert_eq!(c["block_io"], "4.0 KiB / 8.0 KiB");
     assert!(!data.to_string().contains("STATS_SECRET"));
-    assert!(
-        html(f.app(), "/usage")
-            .await
-            .1
-            .contains("32.0 MiB / 1.0 GiB")
-    );
+    let (_, body) = html(f.app(), "/usage").await;
+    assert!(body.contains("32.0 MiB / 1.0 GiB"));
+    assert!(link(&body, "web").starts_with("/containers/aaaaaaaaaaaa"));
     f.mock.lock().unwrap().stats = json!({"cpu_stats":{"cpu_usage":{"total_usage":0},"system_cpu_usage":0,"online_cpus":0},"precpu_stats":{"cpu_usage":{"total_usage":1},"system_cpu_usage":1},"memory_stats":{"usage":1,"limit":0,"stats":{"inactive_file":10}}});
     let (_, data) = get(f.app(), "/api/usage").await;
     assert!(data["containers"][0]["cpu_percent_value"].is_null());

@@ -352,6 +352,7 @@ pub(super) async fn container_logs(
     };
     let page = data["page"].as_u64().unwrap();
     let until = text(&data["until"]);
+    let name = text(&data["name"]);
     let mut navigation = latest;
     if page > 0 {
         navigation.push_str(&format!(
@@ -384,7 +385,7 @@ pub(super) async fn container_logs(
         &state,
         StatusCode::OK,
         format!(
-            "<h2>Container logs</h2><dl><dt>Container ID</dt><dd>{id}</dd><dt>Snapshot (UTC)</dt><dd>{until}</dd><dt>Page</dt><dd>{} ({} lines)</dd></dl>\
+            "<h2>Logs: {name}</h2><dl><dt>Container</dt><dd><a href=\"/containers/{id}\">{name}</a></dd><dt>Container ID</dt><dd>{id}</dd><dt>Snapshot (UTC)</dt><dd>{until}</dd><dt>Page</dt><dd>{} ({} lines)</dd></dl>\
          <p>Oldest first. Up to 100 lines per page. Latest captures fresh output. Known environment secrets are masked; other sensitive application data may remain.</p><nav aria-label=\"Log pages\">{navigation}</nav>{output}{limit}",
             page + 1,
             lines.len()
@@ -404,9 +405,12 @@ pub(super) async fn usage(State(state): State<AppState>) -> Response {
     );
     let containers = data["containers"].as_array().unwrap();
     for c in containers {
-        content.push_str("<tr>");
+        content.push_str(&format!(
+            "<tr><td><a href=\"/containers/{}\">{}</a></td>",
+            text(&c["id"]),
+            text(&c["name"])
+        ));
         for field in [
-            "name",
             "cpu_percent",
             "memory_usage",
             "memory_percent",
