@@ -33,6 +33,14 @@ Agents can read the HTML directly or use `/api/overview`, `/api/usage`,
 To run from source, install Rust and run `cargo run --release` with permission
 to access `/var/run/docker.sock`.
 
+Format CSS with Node.js installed:
+
+```sh
+npx --yes prettier@3.8.1 --write 'static/**/*.css'
+```
+
+CI checks CSS formatting with the same Prettier version.
+
 ## Design principles
 
 - Text first: complete HTML, ordinary links, and no JavaScript requirement.

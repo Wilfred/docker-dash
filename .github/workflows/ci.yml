@@ -14,6 +14,22 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  css-formatting:
+    name: CSS formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+      - name: Check CSS formatting
+        run: npx --yes prettier@3.8.1 --check 'static/**/*.css'
+
   checks:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -43,7 +59,7 @@ jobs:
 
   image:
     name: Build and publish image
-    needs: checks
+    needs: [checks, css-formatting]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
