@@ -5,3 +5,5 @@
 !src/**
 !static/
 !static/**
+!templates/
+!templates/**

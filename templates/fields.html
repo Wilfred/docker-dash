@@ -1,0 +1,7 @@
+{%- macro fields(rows) -%}
+<dl>
+{%- for (label, value) in rows %}
+<dt>{{ label }}</dt><dd>{{ value }}</dd>
+{%- endfor %}
+</dl>
+{%- endmacro -%}

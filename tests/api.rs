@@ -4,7 +4,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode},
 };
-use docker_dash::{AppState, app};
+use docker_dash::{AppState, Endpoint, app};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Bytes, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -169,7 +169,7 @@ impl Fixture {
     }
     fn state(&self) -> AppState {
         let mut state = AppState::default();
-        state.socket_path = self.dir.join("docker.sock").to_string_lossy().into_owned();
+        state.docker = Endpoint::Unix(self.dir.join("docker.sock"));
         state.uptime_path = self.dir.join("uptime").to_string_lossy().into_owned();
         state
     }
@@ -184,8 +184,17 @@ impl Drop for Fixture {
     }
 }
 async fn html(app: Router, uri: &str) -> (StatusCode, String) {
+    html_for_host(app, uri, "localhost:8080").await
+}
+async fn html_for_host(app: Router, uri: &str, host: &str) -> (StatusCode, String) {
     let response = app
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = response.status();
@@ -201,7 +210,7 @@ fn link(body: &str, label: &str) -> String {
         .find_map(|part| {
             let (url, rest) = part.split_once('"')?;
             rest.starts_with(&format!(">{label}</a>"))
-                .then(|| url.replace("&amp;", "&"))
+                .then(|| url.replace("&#38;", "&"))
         })
         .unwrap()
 }
@@ -407,7 +416,7 @@ async fn tty_and_split_utf8_logs_are_supported_and_html_is_escaped() {
     }
     let (status, body) = html(f.app(), "/containers/aaaaaaaaaaaa/logs").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("&lt;script&gt;"));
+    assert!(body.contains("&#60;script&#62;"));
     assert!(!body.contains("<script>"));
     assert!(!body.contains("ENV_SECRET"));
     {
@@ -431,6 +440,7 @@ async fn minimal_home_links_to_focused_details_and_logs() {
     let f = Fixture::new().await;
     let app = f.app();
     let (_, home) = html(app.clone(), "/").await;
+    assert!(home.contains("<title>docker-dash - test-host</title>"));
     let uri = link(&home, "web");
     assert_eq!(uri, "/containers/aaaaaaaaaaaa");
     assert!(!home.contains("<h3>Diagnostics"));
@@ -469,19 +479,26 @@ async fn usage_calculations_are_bounded_and_allowlisted() {
     let (status, data) = get(f.app(), "/api/usage").await;
     assert_eq!(status, StatusCode::OK, "{data}");
     let c = &data["containers"][0];
-    assert_eq!(c["cpu_percent_value"], 4.0);
+    assert_eq!(c["cpu_percent"], 4.0);
     assert_eq!(c["memory_usage_bytes"], 33554432);
-    assert_eq!(c["memory_percent"], "3.12%");
-    assert_eq!(c["pids"], "3");
-    assert_eq!(c["network_io"], "1.0 KiB / 2.0 KiB");
-    assert_eq!(c["block_io"], "4.0 KiB / 8.0 KiB");
+    assert_eq!(c["memory_percent"], 3.125);
+    assert_eq!(c["pids"], 3);
+    assert_eq!(c["network_rx_bytes"], 1024);
+    assert_eq!(c["block_write_bytes"], 8192);
     assert!(!data.to_string().contains("STATS_SECRET"));
     let (_, body) = html(f.app(), "/usage").await;
-    assert!(body.contains("32.0 MiB / 1.0 GiB"));
+    for expected in [
+        "32.0 MiB / 1.0 GiB",
+        "3.12%",
+        "1.0 KiB / 2.0 KiB",
+        "4.0 KiB / 8.0 KiB",
+    ] {
+        assert!(body.contains(expected), "{expected}");
+    }
     assert!(link(&body, "web").starts_with("/containers/aaaaaaaaaaaa"));
     f.mock.lock().unwrap().stats = json!({"cpu_stats":{"cpu_usage":{"total_usage":0},"system_cpu_usage":0,"online_cpus":0},"precpu_stats":{"cpu_usage":{"total_usage":1},"system_cpu_usage":1},"memory_stats":{"usage":1,"limit":0,"stats":{"inactive_file":10}}});
     let (_, data) = get(f.app(), "/api/usage").await;
-    assert!(data["containers"][0]["cpu_percent_value"].is_null());
+    assert!(data["containers"][0]["cpu_percent"].is_null());
     assert!(data["containers"][0]["memory_percent"].is_null());
     f.mock.lock().unwrap().containers.clear();
     assert_eq!(get(f.app(), "/api/usage").await.1["containers"], json!([]));
@@ -504,13 +521,8 @@ async fn api_errors_limits_and_invalid_queries_do_not_leak_daemon_bodies() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(!data.to_string().contains("DAEMON_SECRET"));
     f.mock.lock().unwrap().overrides.remove("/info");
-    f.mock.lock().unwrap().logs = vec![0; 4 * 1024 * 1024 + 1];
-    assert_eq!(
-        get(f.app(), "/api/containers/aaaaaaaaaaaa/logs").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
     let mut state = f.state();
-    state.socket_path = f.dir.join("missing.sock").to_string_lossy().into_owned();
+    state.docker = Endpoint::Unix(f.dir.join("missing.sock"));
     assert_eq!(
         get(app(state), "/api/overview").await.0,
         StatusCode::SERVICE_UNAVAILABLE
@@ -552,5 +564,114 @@ async fn version_negotiation_and_html_headers_work() {
     assert_eq!(
         get(f.app(), "/api/overview").await.0,
         StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+#[tokio::test]
+async fn large_logs_keep_the_newest_lines_within_limits() {
+    let f = Fixture::new().await;
+    let padding = "x".repeat(1000);
+    {
+        let mut mock = f.mock.lock().unwrap();
+        mock.logs.clear();
+        for i in 0..12_000 {
+            mock.logs.extend(frame(
+                1,
+                format!("2026-01-01T00:00:00.{i:09}Z line {i} {padding}\n").as_bytes(),
+            ));
+        }
+        mock.logs.extend(frame(
+            2,
+            format!(
+                "2026-01-01T00:00:01.000000000Z long {}\n",
+                "y".repeat(40_000)
+            )
+            .as_bytes(),
+        ));
+    }
+    let app = f.app();
+    let (status, first) = get(app.clone(), "/api/containers/aaaaaaaaaaaa/logs").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let lines = first["lines"].as_array().unwrap();
+    let last = lines.last().unwrap().as_str().unwrap();
+    assert!(last.starts_with("2026-01-01T00:00:01.000000000Z long yyy"));
+    assert!(last.ends_with("[line truncated]"));
+    assert!(last.len() < 17 * 1024);
+    assert!(lines[98].as_str().unwrap().contains("line 11999 "));
+    let until = first["until"].as_str().unwrap();
+    let mut page = 0;
+    let oldest = loop {
+        let uri = format!("/api/containers/aaaaaaaaaaaa/logs?page={page}&until={until}");
+        let (status, data) = get(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{data}");
+        if data["has_older"] == false {
+            break data;
+        }
+        page += 1;
+    };
+    // About 8 MiB of 1 KiB lines are kept, fewer than the 10,000 line limit.
+    assert!((75..=80).contains(&page), "{page}");
+    assert_eq!(oldest["history_limit_reached"], true);
+    let (_, body) = html(
+        app,
+        &format!("/containers/aaaaaaaaaaaa/logs?page={page}&until={until}"),
+    )
+    .await;
+    assert!(body.contains("Older output was left out"));
+}
+#[tokio::test]
+async fn logs_since_is_passed_to_docker_and_kept_in_links() {
+    let f = Fixture::new().await;
+    let (status, data) = get(
+        f.app(),
+        "/api/containers/aaaaaaaaaaaa/logs?since=2026-01-01T01:00:00%2B01:00",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{data}");
+    assert_eq!(data["since"], "2026-01-01T00:00:00.000000000Z");
+    assert!(
+        f.mock
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|path| path.contains("/logs?") && path.ends_with("&since=1767225600.000000000"))
+    );
+    let (status, body) = html(f.app(), "/containers/aaaaaaaaaaaa/logs?since=15m").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("value=\"15m\""));
+    assert!(link(&body, "Latest").ends_with("/logs?since=15m"));
+    assert!(link(&body, "Older").ends_with("&since=15m"));
+    assert_eq!(
+        html(f.app(), "/containers/aaaaaaaaaaaa/logs?since=")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(f.app(), "/api/containers/aaaaaaaaaaaa/logs?since=soon")
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+#[tokio::test]
+async fn unexpected_host_headers_are_rejected() {
+    let f = Fixture::new().await;
+    let (status, body) = html_for_host(f.app(), "/", "attacker.example").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!body.contains("test-host"));
+    assert_eq!(
+        html_for_host(f.app(), "/", "server.tail1234.ts.net")
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut state = f.state();
+    state.allowed_hosts = vec!["dash.example.com".into()];
+    assert_eq!(
+        html_for_host(app(state), "/api/overview", "dash.example.com:443")
+            .await
+            .0,
+        StatusCode::OK
     );
 }

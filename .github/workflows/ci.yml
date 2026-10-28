@@ -105,6 +105,7 @@ jobs:
           docker run --rm --entrypoint /bin/sh docker-dash:smoke -c '! command -v docker'
           container_id=$(docker run --detach \
             --publish 127.0.0.1:8080:8080 \
+            --env DOCKER_DASH_BIND=0.0.0.0:8080 \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             --volume /var/run/docker.sock:/var/run/docker.sock:ro \
             docker-dash:smoke)
@@ -126,6 +127,10 @@ jobs:
           curl --fail "http://127.0.0.1:8080/api/containers/$exited_id/logs" \
             | jq --exit-status '(.lines | any(contains("[REDACTED]"))) and (.lines | all(contains("MASK_ME_FROM_LOGS") | not))'
           curl --fail "http://127.0.0.1:8080/api/containers/$container_id/logs" | jq --exit-status '.lines | length > 0'
+          curl --fail "http://127.0.0.1:8080/api/containers/$exited_id/logs?since=1h" | jq --exit-status '.since != null'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' --header 'Host: attacker.example' http://127.0.0.1:8080/)" = 403
+          docker stop "$container_id" > /dev/null
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$container_id")" = 0
       - name: Publish latest and commit image
         if: steps.image.outputs.publish == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
