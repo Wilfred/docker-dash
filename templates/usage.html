@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Resource usage</h2>
+<p>Sampled at (UTC): {{ checked_at }}. Network and block I/O are cumulative counters.</p>
+<p><a href="/usage">Refresh</a> · <a href="/api/usage">Usage JSON</a></p>
+<div class="table-wrap"><table>
+<thead><tr><th>Container</th><th>CPU</th><th>Memory used / limit</th><th>Memory %</th><th>Network RX / TX</th><th>Disk read / write</th><th>Processes</th></tr></thead>
+<tbody>
+{%- for row in rows %}
+<tr><td><a href="/containers/{{ row.id }}">{{ row.name }}</a></td>{% for cell in row.cells %}<td>{{ cell }}</td>{% endfor %}</tr>
+{%- endfor %}
+</tbody>
+</table></div>
+{%- if rows.is_empty() %}
+<p>No running containers.</p>
+{%- endif %}
+{% endblock %}

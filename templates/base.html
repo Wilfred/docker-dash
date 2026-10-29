@@ -4,11 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>{{title}}</title>
+  <title>{{ title }}</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header><h1>docker-dash</h1><nav aria-label="Host navigation"><a href="/">Host overview</a> · <a href="/api/overview">Overview JSON</a> · <a href="/usage">Resource usage</a> · <a href="https://github.com/Wilfred/docker-dash">GitHub</a></nav></header>
-  <main>{{content}}</main>
+  <main>
+{%- block content %}{% endblock -%}
+  </main>
 </body>
 </html>

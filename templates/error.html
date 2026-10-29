@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Request failed</h2>
+<p class="error" role="alert">{{ message }}</p>
+{%- if let Some((href, label)) = recovery %}
+<p><a href="{{ href }}">{{ label }}</a></p>
+{%- endif %}
+{% endblock %}

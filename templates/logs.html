@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Logs: {{ name }}</h2>
+<dl><dt>Container</dt><dd><a href="/containers/{{ id }}">{{ name }}</a></dd><dt>Container ID</dt><dd>{{ id }}</dd><dt>Snapshot (UTC)</dt><dd>{{ until }}</dd>
+{%- if let Some(since) = since %}<dt>Since (UTC)</dt><dd>{{ since }}</dd>{% endif -%}
+<dt>Page</dt><dd>{{ page }} ({{ lines.len() }} lines)</dd></dl>
+<form method="get" action="/containers/{{ id }}/logs"><label for="since">Since</label> <input id="since" name="since" value="{{ since_input }}" placeholder="15m, 2h or 2026-01-01T00:00:00Z"> <button type="submit">Show</button></form>
+<p>Oldest first. Up to 100 lines per page. Latest captures fresh output. Known environment secrets are masked; other sensitive application data may remain.</p>
+<nav aria-label="Log pages">
+{%- for (href, label) in navigation -%}
+{% if !loop.first %} · {% endif %}<a href="{{ href }}">{{ label }}</a>
+{%- endfor -%}
+</nav>
+{%- if lines.is_empty() %}
+<p>No log output for this page.</p>
+{%- else %}
+<pre aria-label="Container log output">{{ lines.join("\n") }}</pre>
+{%- endif %}
+{%- if history_limit_reached %}
+<p>Older output was left out (limit: 10,000 lines or 8 MiB).</p>
+{%- endif %}
+{% endblock %}

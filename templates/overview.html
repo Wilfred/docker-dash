@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% import "fields.html" as macros %}
+{% block content %}
+<h2>Host</h2>
+{% call macros::fields(host) %}{% endcall %}
+<p><a href="/">Refresh</a></p>
+<h2>Containers ({{ containers.len() }})</h2>
+{%- if containers.is_empty() %}
+<p>No containers.</p>
+{%- else %}
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Container</th><th scope="col">Status</th><th scope="col">Image</th><th scope="col">Image built (UTC)</th><th scope="col">Uptime</th><th scope="col">Logs</th></tr></thead>
+<tbody>
+{%- for c in containers %}
+<tr><th scope="row"><a href="/containers/{{ c.id }}">{{ c.name }}</a></th><td>{{ c.status }}</td><td>{{ c.image }}</td><td>{{ c.image_created_at }}</td><td>{{ c.uptime }}</td><td><a href="/containers/{{ c.id }}/logs" aria-label="Logs for {{ c.name }}">Logs</a></td></tr>
+{%- endfor %}
+</tbody>
+</table></div>
+{%- endif %}
+{% endblock %}

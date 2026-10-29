@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% import "fields.html" as macros %}
+{% block content %}
+<h2>{{ name }}</h2>
+<p><a href="/api/containers/{{ id }}">Container JSON</a> · <a href="/containers/{{ id }}/logs">Logs</a> · <a href="/api/containers/{{ id }}/logs">Logs JSON</a></p>
+{% call macros::fields(summary) %}{% endcall %}
+<h3>Diagnostics</h3>
+{% call macros::fields(diagnostics) %}{% endcall %}
+<h3>Ports</h3>
+{%- if host_networking %}
+<p>Host networking: listens directly on the host. Docker does not report port bindings.</p>
+{%- endif %}
+{%- if ports.is_empty() %}
+<p>None declared or published.</p>
+{%- else %}
+<ul>
+{%- for port in ports %}
+<li>{{ port }}</li>
+{%- endfor %}
+</ul>
+{%- endif %}
+<h3>Networks</h3>
+{%- if networks.is_empty() %}
+<p>No network attachments.</p>
+{%- else %}
+<ul>
+{%- for network in networks %}
+<li>{{ network }}</li>
+{%- endfor %}
+</ul>
+{%- endif %}
+{% endblock %}
